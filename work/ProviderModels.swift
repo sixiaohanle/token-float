@@ -6,6 +6,7 @@ struct HistoryUsageEvent {
     let tokens: Int64
     var legacyGroup: String? = nil
     var supersedesLegacy: [String] = []
+    var threadID: String? = nil
 }
 
 struct HistoryLogRevision: Equatable {

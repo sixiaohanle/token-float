@@ -23,6 +23,7 @@ final class UsageHistory: ObservableObject {
     private let defaults: UserDefaults
     @Published private var days: [String: [String: Int64]]
     private var imported: [String: [String: LedgerDayTotal]]
+    private var archives: [String: ArchiveUsageTotals]
     @Published private var importStatus: [MeterProvider: HistoryImportStatus] = [:]
 
     init(defaults: UserDefaults = .standard, ledger: LocalUsageLedger? = nil) {
@@ -30,6 +31,7 @@ final class UsageHistory: ObservableObject {
         let stored = defaults.data(forKey: Self.key)
         days = stored.flatMap { try? JSONDecoder().decode([String: [String: Int64]].self, from: $0) } ?? [:]
         imported = ledger?.savedTotals() ?? [:]
+        archives = ledger?.savedArchives() ?? [:]
     }
 
     static func dayKey(for date: Date) -> String {
@@ -49,8 +51,18 @@ final class UsageHistory: ObservableObject {
         return DailyTokenSnapshot(total: total, complete: true)
     }
 
-    func receive(_ changes: [String: LedgerDayTotal], source: String) {
+    func receive(_ changes: [String: LedgerDayTotal], recovered: ArchiveUsageTotals? = nil, source: String) {
         var published = false
+        if let recovered {
+            let previous = archives[source] ?? ArchiveUsageTotals()
+            if recovered.revision >= previous.revision {
+                if !recovered.hasSameBuckets(as: previous) {
+                    objectWillChange.send()
+                    published = true
+                }
+                archives[source] = recovered
+            }
+        }
         for (day, incoming) in changes {
             let previous = imported[source]?[day] ?? LedgerDayTotal()
             guard incoming.revision >= previous.revision, incoming != previous else { continue }
@@ -62,6 +74,23 @@ final class UsageHistory: ObservableObject {
             }
             imported[source, default: [:]][day] = incoming
         }
+    }
+
+    func oldestLegacyDay(for provider: MeterProvider, home: URL) -> String? {
+        let source = key(for: provider, home: home)
+        return days.keys.filter { (days[$0]?[source] ?? 0) > 0 }.min()
+    }
+
+    func archiveUsage(homes: [MeterProvider: URL]) -> ArchiveUsageTotals {
+        var result = ArchiveUsageTotals()
+        for (provider, home) in homes {
+            guard let archive = archives[LocalUsageLedger.sourceKey(provider: provider, home: home)] else { continue }
+            result.days.merge(archive.days, uniquingKeysWith: addingUsage)
+            result.months.merge(archive.months, uniquingKeysWith: addingUsage)
+            result.undated = addingUsage(result.undated, archive.undated)
+            result.backendOnly = addingUsage(result.backendOnly, archive.backendOnly)
+        }
+        return result
     }
 
     func setImportStatus(_ status: HistoryImportStatus?, for provider: MeterProvider) {
@@ -95,6 +124,7 @@ final class UsageHistory: ObservableObject {
         var dates = Set(days.keys)
         for source in sources {
             if let ledgerDays = imported[source.ledger] { dates.formUnion(ledgerDays.keys) }
+            if let archive = archives[source.ledger] { dates.formUnion(archive.days.keys) }
         }
         return dates.sorted(by: >).compactMap { day in
             guard startKey.map({ day >= $0 }) ?? true else { return nil }
@@ -107,8 +137,10 @@ final class UsageHistory: ObservableObject {
 
     private func total(on day: String, legacySource: String, source: String) -> Int64? {
         let legacy = days[day]?[legacySource]
-        guard let total = imported[source]?[day], total.hasEvents else { return legacy }
-        return total.includingLegacy(legacy ?? 0)
+        let importedTotal = imported[source]?[day]
+        let dated = importedTotal.flatMap { $0.hasEvents ? $0.includingLegacy(legacy ?? 0) : nil } ?? legacy
+        guard let recovery = archives[source]?.days[day] else { return dated }
+        return addingUsage(dated ?? 0, recovery)
     }
 }
 
@@ -125,8 +157,9 @@ struct UsageHistoryView: View {
         let selectedHomes = homes.filter { provider == nil || $0.key == provider }
         let entries = history.rows(homes: selectedHomes, since: nil)
             .filter { $0.id <= today }
+        let recovered = history.archiveUsage(homes: selectedHomes)
         let activity = TokenActivityCalendar(entries: entries, from: nil, through: now, minimumDays: 365)
-        let total = activity.total
+        let total = addingUsage(activity.total, recovered.outsideDaily)
         VStack(alignment: .leading, spacing: 12) {
             sourcePicker
 
@@ -137,7 +170,7 @@ struct UsageHistoryView: View {
             }
 
             HStack(alignment: .lastTextBaseline, spacing: 6) {
-                Text(entries.isEmpty ? "–" : numberStyle.format(total))
+                Text(entries.isEmpty && recovered.outsideDaily == 0 ? "–" : numberStyle.format(total))
                     .font(.system(size: 25, weight: .semibold, design: .monospaced))
                     .lineLimit(1)
                     .minimumScaleFactor(0.65)
@@ -158,7 +191,11 @@ struct UsageHistoryView: View {
             .padding(14)
             .background(card)
 
-            TokenActivityChart(activity: activity)
+            TokenActivityChart(activity: activity, numberStyle: numberStyle)
+
+            if !recovered.months.isEmpty || recovered.undated > 0 {
+                recoveredUsage(recovered, days: entries)
+            }
 
             if !entries.isEmpty {
                 LazyVStack(spacing: 0) {
@@ -171,6 +208,37 @@ struct UsageHistoryView: View {
                 .background(card)
             }
         }
+    }
+
+    private func recoveredUsage(_ archive: ArchiveUsageTotals, days: [UsageHistoryDay]) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("归档补录")
+                .font(.system(size: 12, weight: .semibold))
+                .padding(.vertical, 9)
+            ForEach(archive.months.keys.sorted(by: >), id: \.self) { month in
+                let monthOnly = archive.months[month] ?? 0
+                let dated = days.lazy.filter { $0.id.hasPrefix(month) }.map(\.total).reduce(0, addingUsage)
+                Divider()
+                recoveredRow("\(month) 合计", total: addingUsage(dated, monthOnly))
+                    .help("其中 \(DailyNumberStyle.exact.format(monthOnly)) token 只确认到月份。")
+            }
+            if archive.undated > 0 {
+                Divider()
+                recoveredRow("未分日 · 计入总量", total: archive.undated)
+            }
+        }
+        .padding(.horizontal, 13)
+        .background(card)
+    }
+
+    private func recoveredRow(_ title: String, total: Int64) -> some View {
+        HStack {
+            Text(title).font(.system(size: 11)).foregroundStyle(.secondary)
+            Spacer()
+            Text(numberStyle.format(total) + " token")
+                .font(.system(size: 13, weight: .medium, design: .monospaced))
+        }
+        .padding(.vertical, 10)
     }
 
     private var sourcePicker: some View {
@@ -195,7 +263,7 @@ struct UsageHistoryView: View {
         .padding(.vertical, 10)
         .accessibilityElement(children: .combine)
         .help(MeterProvider.allCases.compactMap { provider in
-            day.totals[provider].map { provider.title + " · " + DailyNumberStyle.exact.format($0) + " token" }
+            day.totals[provider].map { provider.title + " · " + numberStyle.format($0) + " token" }
         }.joined(separator: "\n"))
     }
 
@@ -302,6 +370,7 @@ private struct TokenActivityChart: View {
     }
 
     let activity: TokenActivityCalendar
+    let numberStyle: DailyNumberStyle
     @Environment(\.colorScheme) private var colorScheme
     @State private var mode: Mode = .daily
     @State private var hovered: HoveredActivity?
@@ -451,9 +520,9 @@ private struct TokenActivityChart: View {
 
     private func dayDetail(_ day: TokenActivityCalendar.Day) -> String {
         if mode == .cumulative {
-            return "累计 \(DailyNumberStyle.exact.format(day.cumulative)) token"
+            return "累计 \(numberStyle.format(day.cumulative)) token"
         }
-        return day.usage.map { "当日 \(DailyNumberStyle.exact.format($0.total)) token" } ?? "暂无记录"
+        return day.usage.map { "当日 \(numberStyle.format($0.total)) token" } ?? "暂无记录"
     }
 
     private func weekBar(_ week: TokenActivityCalendar.Week) -> some View {
@@ -461,7 +530,7 @@ private struct TokenActivityChart: View {
         let first = dates.first ?? ""
         let last = dates.last ?? first
         let span = first == last ? first : "\(first) 至 \(last)"
-        let detail = week.recordedDays == 0 ? "暂无记录" : "本周 \(DailyNumberStyle.exact.format(week.total)) token"
+        let detail = week.recordedDays == 0 ? "暂无记录" : "本周 \(numberStyle.format(week.total)) token"
         return activityCell(title: span, detail: detail) {
             Color.clear
                 .frame(width: cellSize, height: gridHeight)

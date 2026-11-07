@@ -25,7 +25,7 @@ xcrun swiftc -O -target "$architecture-apple-macosx$minimum_version" \
     "$work_dir/RunningCat.swift" "$work_dir/CodexMeter.swift" \
     "$work_dir/DailyTokenUsage.swift" "$work_dir/ClaudeCodeMeter.swift" "$work_dir/ProviderModels.swift" \
     "$work_dir/MeterSettings.swift" "$work_dir/MeterApplication.swift" "$work_dir/UsageHistory.swift" \
-    "$work_dir/GitHubUpdateChecker.swift" "$work_dir/LocalUsageLedger.swift" \
+    "$work_dir/GitHubUpdateChecker.swift" "$work_dir/LocalUsageLedger.swift" "$work_dir/CodexArchiveRecovery.swift" \
     -lsqlite3 -o "$contents/MacOS/TokenFloat"
 
 cat > "$contents/Info.plist" <<PLIST
@@ -50,9 +50,9 @@ cat > "$contents/Info.plist" <<PLIST
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.7.11</string>
+    <string>0.7.12</string>
     <key>CFBundleVersion</key>
-    <string>22</string>
+    <string>23</string>
     <key>LSMinimumSystemVersion</key>
     <string>$minimum_version</string>
     <key>LSUIElement</key>

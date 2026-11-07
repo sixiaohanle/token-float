@@ -22,10 +22,10 @@ private final class MeterSourceMonitor {
     private let importCancellation = HistoryImportCancellation()
 
     init(
-        provider: MeterProvider, home: URL, ledger: LocalUsageLedger, source: String,
+        provider: MeterProvider, home: URL, ledger: LocalUsageLedger, source: String, oldestLegacyDay: String?,
         receiveRate: @escaping (UUID, MeterSnapshot) -> Void,
-        receiveDaily: @escaping (UUID, Date, Bool, [String: LedgerDayTotal]) -> Void,
-        receiveHistory: @escaping (UUID, HistoryImportStatus?, [String: LedgerDayTotal]) -> Void
+        receiveDaily: @escaping (UUID, Date, Bool, [String: LedgerDayTotal], ArchiveUsageTotals?) -> Void,
+        receiveHistory: @escaping (UUID, HistoryImportStatus?, [String: LedgerDayTotal], ArchiveUsageTotals?) -> Void
     ) {
         self.home = home
         let sampleRate: () -> MeterSnapshot
@@ -68,17 +68,19 @@ private final class MeterSourceMonitor {
         dailyTimer.schedule(deadline: .now(), repeating: .seconds(5), leeway: .milliseconds(300))
         dailyTimer.setEventHandler {
             let date = Date()
-            let (complete, changes) = autoreleasepool { () -> (Bool, [String: LedgerDayTotal]) in
-                guard ledger.isAvailable else { return (false, [:]) }
+            let (complete, changes, archive) = autoreleasepool { () -> (Bool, [String: LedgerDayTotal], ArchiveUsageTotals?) in
+                guard ledger.isAvailable else { return (false, [:], nil) }
                 let sampled = sampleDaily(date)
-                let changes = sampled.events.isEmpty ? [:] : ledger.record(sampled.events, source: source)
+                var archive: ArchiveUsageTotals?
+                let changes = sampled.events.isEmpty ? [:] : ledger.record(sampled.events, source: source) { archive = $0 }
                 if changes != nil { didPersistDaily() }
-                return (sampled.complete && changes != nil, changes ?? [:])
+                return (sampled.complete && changes != nil, changes ?? [:], archive)
             }
             let day = UsageDayKey.make(for: date)
-            guard !changes.isEmpty || lastDailyStatus?.day != day || lastDailyStatus?.complete != complete else { return }
+            guard !changes.isEmpty || archive != nil || lastDailyStatus?.day != day
+                    || lastDailyStatus?.complete != complete else { return }
             lastDailyStatus = (day, complete)
-            DispatchQueue.main.async { receiveDaily(identity, date, complete, changes) }
+            DispatchQueue.main.async { receiveDaily(identity, date, complete, changes, archive) }
         }
         rateTimer.resume()
         dailyTimer.resume()
@@ -86,29 +88,52 @@ private final class MeterSourceMonitor {
         let cancellation = importCancellation
         DispatchQueue.global(qos: .background).async {
             var pending: [String: LedgerDayTotal] = [:]
+            var pendingArchive: ArchiveUsageTotals?
             var lastDelivery = Date()
             var failed = !ledger.isAvailable
             func deliver(_ status: HistoryImportStatus?) {
                 let changes = pending
+                let archive = pendingArchive
                 pending.removeAll(keepingCapacity: true)
+                pendingArchive = nil
                 lastDelivery = Date()
-                DispatchQueue.main.async { receiveHistory(identity, status, changes) }
+                DispatchQueue.main.async { receiveHistory(identity, status, changes, archive) }
             }
             let complete = !failed && scanHistory(
                 Date(),
                 { ledger.needsImport($0, source: source) },
                 { failed || cancellation.isCancelled },
                 { file, events in
-                    guard let changes = ledger.record(events, source: source, file: file) else {
+                    guard let changes = ledger.record(events, source: source, file: file, archiveChange: {
+                        pendingArchive = $0
+                    }) else {
                         failed = true
                         return
                     }
                     pending.merge(changes) { _, latest in latest }
-                    if !pending.isEmpty && Date().timeIntervalSince(lastDelivery) >= 0.5 {
+                    if (!pending.isEmpty || pendingArchive != nil) && Date().timeIntervalSince(lastDelivery) >= 0.5 {
                         deliver(.importing)
                     }
                 }
             )
+            if complete && !failed && provider == .codex && !cancellation.isCancelled {
+                let candidates = CodexArchiveRecovery.candidates(home: home)
+                if let recovered = ledger.recordVerifiedArchives(candidates, source: source, oldestLegacyDay: oldestLegacyDay) {
+                    pendingArchive = recovered
+                } else {
+                    failed = true
+                }
+                if !failed && !cancellation.isCancelled,
+                   let localArchives = CodexArchiveRecovery.backendCandidates(home: home) {
+                    if let recovered = ledger.recordBackendArchives(
+                        localArchives, source: source, oldestLegacyDay: oldestLegacyDay
+                    ) {
+                        pendingArchive = recovered
+                    } else {
+                        failed = true
+                    }
+                }
+            }
             if !cancellation.isCancelled { deliver(complete && !failed ? nil : .incomplete) }
         }
     }
@@ -332,6 +357,7 @@ final class MeterApplication: NSObject, NSApplicationDelegate {
             let source = LocalUsageLedger.sourceKey(provider: provider, home: home)
             monitors[provider] = MeterSourceMonitor(
                 provider: provider, home: home, ledger: ledger, source: source,
+                oldestLegacyDay: history.oldestLegacyDay(for: provider, home: home),
                 receiveRate: { [weak self] identity, snapshot in
                     guard let self, monitors[provider]?.identity == identity else { return }
                     rates[provider] = snapshot
@@ -342,17 +368,17 @@ final class MeterApplication: NSObject, NSApplicationDelegate {
                     preferences.setStatus(status, for: provider)
                     publish()
                 },
-                receiveDaily: { [weak self] identity, date, complete, changes in
+                receiveDaily: { [weak self] identity, date, complete, changes, archive in
                     guard let self, monitors[provider]?.identity == identity else { return }
-                    history.receive(changes, source: source)
+                    history.receive(changes, recovered: archive, source: source)
                     guard UsageHistory.dayKey(for: date) == UsageHistory.dayKey(for: Date()) else { return }
                     let cached = history.snapshot(for: provider, home: home, at: date)?.total ?? 0
                     daily[provider] = DailyTokenSnapshot(total: cached, complete: complete)
                     publish()
                 },
-                receiveHistory: { [weak self] identity, status, changes in
+                receiveHistory: { [weak self] identity, status, changes, archive in
                     guard let self, monitors[provider]?.identity == identity else { return }
-                    history.receive(changes, source: source)
+                    history.receive(changes, recovered: archive, source: source)
                     history.setImportStatus(status, for: provider)
                     if let cached = history.snapshot(for: provider, home: home) {
                         daily[provider] = DailyTokenSnapshot(

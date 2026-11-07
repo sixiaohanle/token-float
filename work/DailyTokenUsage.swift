@@ -199,11 +199,12 @@ private final class DailyUsageFile {
         if modern {
             return HistoryUsageEvent(
                 id: "response:\(key.historyID)", time: usage.time, tokens: usage.tokens,
-                supersedesLegacy: usage.supersededTurns.map(\.historyGroup).sorted()
+                supersedesLegacy: usage.supersededTurns.map(\.historyGroup).sorted(), threadID: key.thread
             )
         }
         return HistoryUsageEvent(
-            id: "legacy:\(key.historyID)", time: usage.time, tokens: usage.tokens, legacyGroup: usage.turn.historyGroup
+            id: "legacy:\(key.historyID)", time: usage.time, tokens: usage.tokens,
+            legacyGroup: usage.turn.historyGroup, threadID: key.thread
         )
     }
 
@@ -299,7 +300,8 @@ final class DailyTokenUsage {
                     pendingUsageEvents[event.id] = HistoryUsageEvent(
                         id: event.id, time: min(pending.time, event.time), tokens: max(pending.tokens, event.tokens),
                         legacyGroup: pending.legacyGroup ?? event.legacyGroup,
-                        supersedesLegacy: Set(pending.supersedesLegacy).union(event.supersedesLegacy).sorted()
+                        supersedesLegacy: Set(pending.supersedesLegacy).union(event.supersedesLegacy).sorted(),
+                        threadID: event.threadID
                     )
                 } else {
                     pendingUsageEvents[event.id] = event

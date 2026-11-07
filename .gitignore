@@ -2,6 +2,7 @@
 /outputs/
 /work/*
 !/work/ClaudeCodeMeter.swift
+!/work/CodexArchiveRecovery.swift
 !/work/CodexMeter.swift
 !/work/DailyTokenUsage.swift
 !/work/DetailSessionScroll.swift

@@ -13,6 +13,20 @@ struct LedgerDayTotal: Equatable {
     }
 }
 
+struct ArchiveUsageTotals: Equatable {
+    var days: [String: Int64] = [:]
+    var months: [String: Int64] = [:]
+    var undated: Int64 = 0
+    var backendOnly: Int64 = 0
+    var revision: UInt64 = 0
+
+    var outsideDaily: Int64 { months.values.reduce(addingUsage(undated, backendOnly), addingUsage) }
+
+    func hasSameBuckets(as other: Self) -> Bool {
+        days == other.days && months == other.months && undated == other.undated && backendOnly == other.backendOnly
+    }
+}
+
 func addingUsage(_ left: Int64, _ right: Int64) -> Int64 {
     let (total, overflow) = left.addingReportingOverflow(right)
     return overflow ? Int64.max : total
@@ -27,9 +41,10 @@ enum UsageDayKey {
     }
 }
 
-// The database stores daily sums and opaque bookkeeping keys. Conversation text,
+// The database stores usage sums and opaque bookkeeping keys. Conversation text,
 // titles, model names and paths stay out of it.
 final class LocalUsageLedger: @unchecked Sendable {
+    private static let backendBucket = "local-backend"
     private let queue = DispatchQueue(label: "com.xiaohan.codex-token-float.usage-ledger", qos: .utility)
     private let db: UsageDatabase?
     private let migrationTime: Double
@@ -92,6 +107,144 @@ final class LocalUsageLedger: @unchecked Sendable {
         }
     }
 
+    func savedArchives() -> [String: ArchiveUsageTotals] {
+        queue.sync { (try? readArchives()) ?? [:] }
+    }
+
+    private func readArchives(for source: String? = nil) throws -> [String: ArchiveUsageTotals] {
+        guard let db else { throw UsageDatabaseError.operationFailed }
+        let filter = source == nil ? "" : " AND source = ?"
+        let rows = try db.statement("SELECT source, bucket, tokens FROM archive_usage WHERE tokens > 0" + filter)
+        if let source { try rows.bind(source, at: 1) }
+        var totals: [String: ArchiveUsageTotals] = [:]
+        while try rows.next() {
+            let key = rows.string(at: 0)
+            let bucket = rows.string(at: 1)
+            let tokens = rows.integer(at: 2)
+            var total = totals[key] ?? ArchiveUsageTotals(revision: revision)
+            if bucket == Self.backendBucket {
+                total.backendOnly = addingUsage(total.backendOnly, tokens)
+            } else {
+                switch bucket.count {
+                case 10: total.days[bucket] = addingUsage(total.days[bucket] ?? 0, tokens)
+                case 7: total.months[bucket] = addingUsage(total.months[bucket] ?? 0, tokens)
+                default: total.undated = addingUsage(total.undated, tokens)
+                }
+            }
+            totals[key] = total
+        }
+        return totals
+    }
+
+    func recordVerifiedArchives(
+        _ candidates: [CodexArchiveCandidate], source: String, oldestLegacyDay: String?
+    ) -> ArchiveUsageTotals? {
+        queue.sync {
+            guard let db else { return nil }
+            let firstScanDay = Calendar.autoupdatingCurrent.startOfDay(for: Date(timeIntervalSince1970: migrationTime))
+            // The old live sampler could persist recent events without a completed-file checkpoint.
+            guard let liveCutoff = Calendar.autoupdatingCurrent.date(byAdding: .day, value: -1, to: firstScanDay)
+            else { return nil }
+            do {
+                try db.exec("BEGIN IMMEDIATE")
+                let knownFile = try db.statement("SELECT 1 FROM imported_files WHERE source = ? AND id = ?")
+                let unownedDay = try db.statement("""
+                    SELECT 1 FROM archive_legacy_coverage WHERE source = ? AND day BETWEEN ? AND ? LIMIT 1
+                    """)
+                let insert = try db.statement("""
+                    INSERT INTO archive_usage VALUES (?, ?, ?, ?)
+                    ON CONFLICT(source, id) DO UPDATE SET bucket = excluded.bucket, tokens = excluded.tokens
+                    WHERE archive_usage.bucket = '\(Self.backendBucket)'
+                    """)
+                for candidate in candidates {
+                    guard candidate.tokens > 0 else { continue }
+                    let firstDay = UsageDayKey.make(for: candidate.startedAt)
+                    let lastDay: String
+                    if let end = candidate.endedAt {
+                        guard candidate.startedAt <= end, end < liveCutoff else { continue }
+                        lastDay = UsageDayKey.make(for: end)
+                        guard oldestLegacyDay.map({ lastDay < $0 }) ?? true else { continue }
+                    } else {
+                        // No upper date bound means any older aggregate may overlap.
+                        guard oldestLegacyDay == nil else { continue }
+                        lastDay = "9999-12-31"
+                    }
+                    try unownedDay.bind(source, at: 1)
+                    try unownedDay.bind(firstDay, at: 2)
+                    try unownedDay.bind(lastDay, at: 3)
+                    let mightOverlap = try unownedDay.next()
+                    unownedDay.reset()
+                    guard !mightOverlap else { continue }
+                    guard try !hasImportedLog(candidate, source: source, statement: knownFile) else { continue }
+
+                    let firstMonth = firstDay.prefix(7)
+                    let bucket = firstDay == lastDay ? firstDay
+                        : firstMonth == lastDay.prefix(7) ? String(firstMonth) : ""
+                    try insert.bind(source, at: 1)
+                    try insert.bind(Self.fingerprint(candidate.threadID.lowercased()), at: 2)
+                    try insert.bind(bucket, at: 3)
+                    try insert.bind(candidate.tokens, at: 4)
+                    try insert.run()
+                }
+                var totals = try readArchives(for: source)[source] ?? ArchiveUsageTotals()
+                try db.exec("COMMIT")
+                revision += 1
+                totals.revision = revision
+                return totals
+            } catch {
+                try? db.exec("ROLLBACK")
+                return nil
+            }
+        }
+    }
+
+    func recordBackendArchives(
+        _ candidates: [CodexArchiveCandidate], source: String, oldestLegacyDay: String? = nil
+    ) -> ArchiveUsageTotals? {
+        queue.sync {
+            guard let db else { return nil }
+            do {
+                try db.exec("BEGIN IMMEDIATE")
+                let knownFile = try db.statement("SELECT 1 FROM imported_files WHERE source = ? AND id = ?")
+                let insert = try db.statement("""
+                    INSERT INTO archive_usage VALUES (?, ?, ?, ?)
+                    ON CONFLICT(source, id) DO UPDATE SET tokens = excluded.tokens
+                    WHERE archive_usage.bucket = excluded.bucket AND archive_usage.tokens != excluded.tokens
+                    """)
+                for candidate in candidates where candidate.tokens > 0 {
+                    if let oldestLegacyDay {
+                        guard let end = candidate.endedAt, UsageDayKey.make(for: end) < oldestLegacyDay else { continue }
+                    }
+                    guard try !hasImportedLog(candidate, source: source, statement: knownFile) else { continue }
+                    try insert.bind(source, at: 1)
+                    try insert.bind(Self.fingerprint(candidate.threadID.lowercased()), at: 2)
+                    try insert.bind(Self.backendBucket, at: 3)
+                    try insert.bind(candidate.tokens, at: 4)
+                    try insert.run()
+                }
+                var totals = try readArchives(for: source)[source] ?? ArchiveUsageTotals()
+                try db.exec("COMMIT")
+                revision += 1
+                totals.revision = revision
+                return totals
+            } catch {
+                try? db.exec("ROLLBACK")
+                return nil
+            }
+        }
+    }
+
+    private func hasImportedLog(
+        _ candidate: CodexArchiveCandidate, source: String, statement: UsageStatement
+    ) throws -> Bool {
+        try candidate.logPaths.contains { url in
+            try statement.bind(source, at: 1)
+            try statement.bind(Self.fingerprint(url.standardizedFileURL.path), at: 2)
+            defer { statement.reset() }
+            return try statement.next()
+        }
+    }
+
     func needsImport(_ file: HistoryLogRevision, source: String) -> Bool {
         queue.sync {
             guard let db else { return false }
@@ -110,16 +263,23 @@ final class LocalUsageLedger: @unchecked Sendable {
     }
 
     func record(
-        _ events: [HistoryUsageEvent], source: String, file: HistoryLogRevision? = nil
+        _ events: [HistoryUsageEvent], source: String, file: HistoryLogRevision? = nil,
+        archiveChange: (ArchiveUsageTotals) -> Void = { _ in }
     ) -> [String: LedgerDayTotal]? {
         queue.sync {
             guard let db else { return nil }
             if events.isEmpty && file == nil { return [:] }
             do {
                 try db.exec("BEGIN IMMEDIATE; DELETE FROM changed_days;")
-                let changed = try write(events, source: source, file: file, in: db)
+                let (changed, replacedArchive) = try write(events, source: source, file: file, in: db)
+                let archives = replacedArchive
+                    ? try readArchives(for: source)[source] ?? ArchiveUsageTotals() : nil
                 try db.exec("COMMIT")
                 revision += 1
+                if var archive = archives {
+                    archive.revision = revision
+                    archiveChange(archive)
+                }
                 return changed.mapValues { total in
                     var updated = total
                     updated.revision = revision
@@ -134,8 +294,22 @@ final class LocalUsageLedger: @unchecked Sendable {
 
     private func write(
         _ events: [HistoryUsageEvent], source: String, file: HistoryLogRevision?, in db: UsageDatabase
-    ) throws -> [String: LedgerDayTotal] {
+    ) throws -> ([String: LedgerDayTotal], Bool) {
+        var replacedArchive = false
         if !events.isEmpty {
+            // Keep the thread marker even after a rollout is deleted again.
+            let discard = try db.statement("UPDATE archive_usage SET bucket = '', tokens = 0 WHERE source = ? AND id = ? AND tokens > 0")
+            let observed = try db.statement("INSERT OR IGNORE INTO archive_usage VALUES (?, ?, '', 0)")
+            for thread in Set(events.filter { $0.tokens > 0 }.compactMap(\.threadID)) {
+                let fingerprint = Self.fingerprint(thread.lowercased())
+                try discard.bind(source, at: 1)
+                try discard.bind(fingerprint, at: 2)
+                try discard.run()
+                replacedArchive = replacedArchive || sqlite3_changes(db.connection) > 0
+                try observed.bind(source, at: 1)
+                try observed.bind(fingerprint, at: 2)
+                try observed.run()
+            }
             let eventRow = try db.statement("""
                 INSERT INTO events VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source, id) DO UPDATE SET
@@ -210,7 +384,7 @@ final class LocalUsageLedger: @unchecked Sendable {
             }
             result[day] = total
         }
-        return result
+        return (result, replacedArchive)
     }
 
     private static let schema = """
@@ -234,6 +408,20 @@ final class LocalUsageLedger: @unchecked Sendable {
             source TEXT NOT NULL, id BLOB NOT NULL, modified REAL NOT NULL,
             size INTEGER NOT NULL, identity TEXT NOT NULL, PRIMARY KEY (source, id)
         ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS archive_usage (
+            source TEXT NOT NULL, id BLOB NOT NULL, bucket TEXT NOT NULL, tokens INTEGER NOT NULL,
+            PRIMARY KEY (source, id)
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS archive_legacy_coverage (
+            source TEXT NOT NULL, day TEXT NOT NULL, PRIMARY KEY (source, day)
+        ) WITHOUT ROWID;
+        BEGIN IMMEDIATE;
+        INSERT OR IGNORE INTO archive_legacy_coverage
+            SELECT source, day FROM totals WHERE NOT EXISTS (
+                SELECT 1 FROM metadata WHERE key = 'archive_owner_tracking'
+            );
+        INSERT OR IGNORE INTO metadata VALUES ('archive_owner_tracking', 1);
+        COMMIT;
         CREATE TEMP TABLE changed_days (day TEXT PRIMARY KEY) WITHOUT ROWID;
         CREATE TEMP TRIGGER event_added AFTER INSERT ON main.events BEGIN
             INSERT OR IGNORE INTO changed_days VALUES (NEW.day);
