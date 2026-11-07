@@ -1,5 +1,20 @@
 import Foundation
 
+struct HistoryUsageEvent {
+    let id: String
+    let time: Date
+    let tokens: Int64
+    var legacyGroup: String? = nil
+    var supersedesLegacy: [String] = []
+}
+
+struct HistoryLogRevision: Equatable {
+    let url: URL
+    let modified: Date
+    let size: UInt64
+    var identity: String = ""
+}
+
 enum MeterProvider: String, CaseIterable, Identifiable {
     case codex
     case claude
@@ -19,6 +34,10 @@ enum MeterProvider: String, CaseIterable, Identifiable {
         case .claude: "projects"
         }
     }
+
+    var historyFolders: [String] {
+        self == .codex ? [historyFolder, "archived_sessions"] : [historyFolder]
+    }
 }
 
 struct ProviderMeter: Identifiable {
@@ -29,19 +48,27 @@ struct ProviderMeter: Identifiable {
 
     var rate: Double? {
         guard snapshot.sourceAvailable else { return nil }
-        let active = snapshot.rows.filter { $0.state != .finished }
-        let sampled = active.compactMap(\.rate)
-        if sampled.isEmpty { return active.isEmpty ? 0 : nil }
-        return sampled.reduce(0, +)
+        var hasActive = false
+        var sampled: Double?
+        for row in snapshot.rows where row.state != .finished {
+            hasActive = true
+            if let rate = row.rate { sampled = (sampled ?? 0) + rate }
+        }
+        return sampled ?? (hasActive ? nil : 0)
     }
 
     static func combinedRate(_ meters: [ProviderMeter]) -> Double? {
-        let available = meters.filter { $0.snapshot.sourceAvailable }
-        guard !available.isEmpty else { return nil }
-        let active = available.flatMap { $0.snapshot.rows.filter { $0.state != .finished } }
-        let sampled = active.compactMap(\.rate)
-        if sampled.isEmpty { return active.isEmpty ? 0 : nil }
-        return sampled.reduce(0, +)
+        var hasSource = false
+        var hasActive = false
+        var sampled: Double?
+        for meter in meters where meter.snapshot.sourceAvailable {
+            hasSource = true
+            for row in meter.snapshot.rows where row.state != .finished {
+                hasActive = true
+                if let rate = row.rate { sampled = (sampled ?? 0) + rate }
+            }
+        }
+        return sampled ?? (hasSource && !hasActive ? 0 : nil)
     }
 }
 

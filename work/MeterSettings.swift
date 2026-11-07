@@ -206,6 +206,7 @@ struct MeterSettingsView: View {
                 .padding(.horizontal, 24)
                 .padding(.vertical, 23)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .background { ThinScrollerInstaller(axis: .vertical) }
             }
             .background(contentColor)
         }
@@ -285,6 +286,7 @@ struct MeterSettingsView: View {
                     }
                     .labelsHidden()
                     .pickerStyle(.segmented)
+                    .controlSize(.small)
                     .frame(width: 220)
                 }
                 Rectangle().fill(separator).frame(height: 1)
@@ -307,6 +309,7 @@ struct MeterSettingsView: View {
                     }
                     .labelsHidden()
                     .pickerStyle(.segmented)
+                    .controlSize(.small)
                     .frame(width: 162)
                 }
             }
@@ -338,43 +341,52 @@ struct MeterSettingsView: View {
     }
 
     private var about: some View {
-        VStack(spacing: 15) {
-            VStack(spacing: 6) {
-                Image(nsImage: NSApp.applicationIconImage)
-                    .resizable()
-                    .frame(width: 64, height: 64)
-                    .accessibilityHidden(true)
-                Text("Token 悬浮球").font(.system(size: 21, weight: .semibold))
-                if let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String {
-                    Text("版本 \(version)").font(.system(size: 12)).foregroundStyle(.secondary)
-                }
-            }
-            .frame(maxWidth: .infinity)
-            Text("Token 悬浮球是一款 macOS 用量小工具。它从本机 Codex 和 Claude Code 会话日志读取数据，在桌面或菜单栏显示输出速率，并在本机保存每日 token 用量。")
-                .font(.system(size: 13))
-                .lineSpacing(4)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(16)
-                .background(cardBackground)
-            VStack(alignment: .leading, spacing: 9) {
-                HStack {
-                    Button("检测更新") { Task { await updates.check() } }
-                        .disabled(updates.state == .checking)
-                    if updates.state == .checking {
-                        ProgressView().controlSize(.small)
-                    }
-                    Spacer()
-                    Link(destination: updates.repositoryURL) {
-                        Label("GitHub 开源地址", systemImage: "arrow.up.right.square")
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(spacing: 12) {
+                    Image(nsImage: NSApp.applicationIconImage)
+                        .resizable()
+                        .frame(width: 48, height: 48)
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("Token 悬浮球").font(.system(size: 19, weight: .semibold))
+                        HStack(spacing: 8) {
+                            if let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String {
+                                Text("版本 \(version)")
+                                    .monospacedDigit()
+                                    .foregroundStyle(.secondary)
+                            }
+                            Button("检测更新") { Task { await updates.check() } }
+                                .controlSize(.small)
+                                .disabled(updates.state == .checking)
+                            if updates.state == .checking {
+                                ProgressView().controlSize(.small)
+                            }
+                        }
                     }
                 }
-                updateStatus
+                Text("Token 悬浮球是一款 macOS 用量小工具。它从本机 Codex 和 Claude Code 会话日志读取数据，在桌面或菜单栏显示输出速率，并在本机保存每日 token 用量。")
+                    .lineSpacing(3)
+                updateStatus.font(.system(size: 11))
             }
             .font(.system(size: 12))
-            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(16)
+            .background(cardBackground)
+
+            settingRow("开源地址") {
+                Link(destination: updates.repositoryURL) {
+                    HStack(spacing: 5) {
+                        Text(updates.repositoryURL.absoluteString)
+                        Image(systemName: "arrow.up.right")
+                            .font(.system(size: 9, weight: .semibold))
+                    }
+                    .font(.system(size: 12))
+                }
+            }
+            .padding(.horizontal, 16)
             .background(cardBackground)
         }
-        .padding(.top, 4)
     }
 
     @ViewBuilder

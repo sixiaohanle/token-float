@@ -8,9 +8,13 @@ struct UsageHistoryDay: Identifiable {
     var total: Int64 { totals.values.reduce(0, Self.adding) }
 
     static func adding(_ left: Int64, _ right: Int64) -> Int64 {
-        let (total, overflow) = left.addingReportingOverflow(right)
-        return overflow ? Int64.max : total
+        addingUsage(left, right)
     }
+}
+
+enum HistoryImportStatus: Equatable {
+    case importing
+    case incomplete
 }
 
 @MainActor
@@ -18,18 +22,18 @@ final class UsageHistory: ObservableObject {
     private static let key = "dailyUsageHistory.v1"
     private let defaults: UserDefaults
     @Published private var days: [String: [String: Int64]]
+    private var imported: [String: [String: LedgerDayTotal]]
+    @Published private var importStatus: [MeterProvider: HistoryImportStatus] = [:]
 
-    init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults = .standard, ledger: LocalUsageLedger? = nil) {
         self.defaults = defaults
         let stored = defaults.data(forKey: Self.key)
         days = stored.flatMap { try? JSONDecoder().decode([String: [String: Int64]].self, from: $0) } ?? [:]
+        imported = ledger?.savedTotals() ?? [:]
     }
 
     static func dayKey(for date: Date) -> String {
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = .autoupdatingCurrent
-        let parts = calendar.dateComponents([.year, .month, .day], from: date)
-        return String(format: "%04d-%02d-%02d", parts.year ?? 0, parts.month ?? 0, parts.day ?? 0)
+        UsageDayKey.make(for: date)
     }
 
     private func key(for provider: MeterProvider, home: URL) -> String {
@@ -37,8 +41,38 @@ final class UsageHistory: ObservableObject {
     }
 
     func snapshot(for provider: MeterProvider, home: URL, at date: Date = Date()) -> DailyTokenSnapshot? {
-        guard let total = days[Self.dayKey(for: date)]?[key(for: provider, home: home)] else { return nil }
+        let source = key(for: provider, home: home)
+        let day = Self.dayKey(for: date)
+        guard let total = total(on: day, legacySource: source, source: LocalUsageLedger.sourceKey(legacyKey: source)) else {
+            return nil
+        }
         return DailyTokenSnapshot(total: total, complete: true)
+    }
+
+    func receive(_ changes: [String: LedgerDayTotal], source: String) {
+        var published = false
+        for (day, incoming) in changes {
+            let previous = imported[source]?[day] ?? LedgerDayTotal()
+            guard incoming.revision >= previous.revision, incoming != previous else { continue }
+            if !published, incoming.hasEvents != previous.hasEvents
+                || incoming.beforeMigration != previous.beforeMigration
+                || incoming.afterMigration != previous.afterMigration {
+                objectWillChange.send()
+                published = true
+            }
+            imported[source, default: [:]][day] = incoming
+        }
+    }
+
+    func setImportStatus(_ status: HistoryImportStatus?, for provider: MeterProvider) {
+        if importStatus[provider] != status { importStatus[provider] = status }
+    }
+
+    func importMessage(for providers: Dictionary<MeterProvider, URL>.Keys) -> String? {
+        let states = providers.compactMap { importStatus[$0] }
+        if states.contains(.importing) { return "正在补录历史用量，结果会陆续显示。" }
+        if states.contains(.incomplete) { return "部分历史日志暂时无法导入，已保留此前保存的用量。" }
+        return nil
     }
 
     func record(_ snapshot: DailyTokenSnapshot, for provider: MeterProvider, home: URL, at date: Date) {
@@ -54,14 +88,27 @@ final class UsageHistory: ObservableObject {
 
     func rows(homes: [MeterProvider: URL], since start: Date?) -> [UsageHistoryDay] {
         let startKey = start.map(Self.dayKey(for:))
-        let sources = homes.mapValues { $0.resolvingSymlinksInPath().standardizedFileURL.path }
-        return days.keys.sorted(by: >).compactMap { day in
-            guard startKey.map({ day >= $0 }) ?? true, let saved = days[day] else { return nil }
-            let totals = Dictionary(uniqueKeysWithValues: sources.compactMap { provider, path in
-                saved[provider.rawValue + ":" + path].map { (provider, $0) }
+        let sources = homes.map { provider, home in
+            let legacy = key(for: provider, home: home)
+            return (provider: provider, legacy: legacy, ledger: LocalUsageLedger.sourceKey(legacyKey: legacy))
+        }
+        var dates = Set(days.keys)
+        for source in sources {
+            if let ledgerDays = imported[source.ledger] { dates.formUnion(ledgerDays.keys) }
+        }
+        return dates.sorted(by: >).compactMap { day in
+            guard startKey.map({ day >= $0 }) ?? true else { return nil }
+            let totals = Dictionary(uniqueKeysWithValues: sources.compactMap { source in
+                total(on: day, legacySource: source.legacy, source: source.ledger).map { (source.provider, $0) }
             })
             return totals.isEmpty ? nil : UsageHistoryDay(id: day, totals: totals)
         }
+    }
+
+    private func total(on day: String, legacySource: String, source: String) -> Int64? {
+        let legacy = days[day]?[legacySource]
+        guard let total = imported[source]?[day], total.hasEvents else { return legacy }
+        return total.includingLegacy(legacy ?? 0)
     }
 }
 
@@ -83,6 +130,12 @@ struct UsageHistoryView: View {
         VStack(alignment: .leading, spacing: 12) {
             sourcePicker
 
+            if let message = history.importMessage(for: selectedHomes.keys) {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             HStack(alignment: .lastTextBaseline, spacing: 6) {
                 Text(entries.isEmpty ? "–" : numberStyle.format(total))
                     .font(.system(size: 25, weight: .semibold, design: .monospaced))
@@ -91,14 +144,21 @@ struct UsageHistoryView: View {
                     .help(DailyNumberStyle.exact.format(total) + " token")
                 Text("token").font(.system(size: 11)).foregroundStyle(.secondary)
                 Spacer()
-                Text("\(entries.count) 个记录日")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
+                VStack(alignment: .trailing, spacing: 4) {
+                    if let earliest = entries.last?.id, let latest = entries.first?.id {
+                        Text(earliest == latest ? earliest : "\(earliest) 至 \(latest)")
+                            .font(.system(size: 10).monospacedDigit())
+                            .lineLimit(1)
+                    }
+                    Text("\(entries.count) 个记录日")
+                        .font(.system(size: 11))
+                }
+                .foregroundStyle(.secondary)
             }
             .padding(14)
             .background(card)
 
-            TokenActivityChart(activity: activity, numberStyle: numberStyle)
+            TokenActivityChart(activity: activity)
 
             if !entries.isEmpty {
                 LazyVStack(spacing: 0) {
@@ -122,6 +182,7 @@ struct UsageHistoryView: View {
         }
         .frame(width: 196)
         .pickerStyle(.segmented)
+        .controlSize(.small)
         .labelsHidden()
     }
 
@@ -221,6 +282,12 @@ struct TokenActivityCalendar {
 }
 
 private struct TokenActivityChart: View {
+    private struct HoveredActivity {
+        let title: String
+        let detail: String
+        let location: CGPoint
+    }
+
     private enum Mode: String, CaseIterable, Identifiable {
         case daily = "每日", weekly = "每周", cumulative = "累计"
 
@@ -228,17 +295,18 @@ private struct TokenActivityChart: View {
         var hint: String {
             switch self {
             case .daily: "悬停查看当天用量。"
-            case .weekly: "悬停查看每周用量。"
+            case .weekly: "每列一周，悬停查看日期和用量。"
             case .cumulative: "悬停查看截至当天的累计用量。"
             }
         }
     }
 
     let activity: TokenActivityCalendar
-    let numberStyle: DailyNumberStyle
     @Environment(\.colorScheme) private var colorScheme
     @State private var mode: Mode = .daily
+    @State private var hovered: HoveredActivity?
 
+    private let timelineSpace = "token-activity-timeline"
     private let gap: CGFloat = 4
     private let cellSize: CGFloat = 13
     private var gridHeight: CGFloat { cellSize * 7 + gap * 6 }
@@ -268,14 +336,10 @@ private struct TokenActivityChart: View {
                 modePicker
             }
 
-            Group {
-                if mode == .weekly {
-                    weeklyChart
-                } else {
-                    dailyChart
-                }
-            }
-            .frame(height: gridHeight + 56)
+            timeline
+                .frame(height: gridHeight + (mode == .weekly ? 39 : 56))
+                .coordinateSpace(name: timelineSpace)
+                .overlay { hoverTooltip }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
@@ -287,69 +351,52 @@ private struct TokenActivityChart: View {
     }
 
     @ViewBuilder
-    private var dailyChart: some View {
+    private var timeline: some View {
         if #available(macOS 14.0, *) {
-            dailyTimeline.defaultScrollAnchor(.trailing).id(mode)
+            timelineScrollView.defaultScrollAnchor(.trailing).id(mode)
         } else {
             ScrollViewReader { scroll in
-                dailyTimeline.task(id: mode) {
-                    if let latest = activity.weeks.last {
-                        scroll.scrollTo(latest.id, anchor: .trailing)
-                    }
+                timelineScrollView.task(id: mode) {
+                    scroll.scrollTo("timeline-latest", anchor: .trailing)
                 }
             }
         }
     }
 
-    private var dailyTimeline: some View {
+    private var timelineScrollView: some View {
         ScrollView(.horizontal) {
             LazyHStack(alignment: .top, spacing: gap) {
                 ForEach(activity.weeks) { week in
                     VStack(alignment: .leading, spacing: 10) {
-                        VStack(spacing: gap) {
-                            ForEach(0..<7, id: \.self) { index in
-                                dayCell(week.days[index])
+                        if mode == .weekly {
+                            weekBar(week)
+                        } else {
+                            VStack(spacing: gap) {
+                                ForEach(0..<7, id: \.self) { index in
+                                    dayCell(week.days[index])
+                                }
                             }
                         }
-                        monthLabel(week.monthLabel, width: cellSize)
+                        monthLabel(week.monthLabel)
                     }
                     .frame(width: cellSize)
                 }
+                Color.clear
+                    .frame(width: 16, height: 1)
+                    .accessibilityHidden(true)
+                    .id("timeline-latest")
             }
+            .background { ThinScrollerInstaller(axis: .horizontal) }
         }
         .scrollIndicators(.visible, axes: .horizontal)
     }
 
-    private var weeklyChart: some View {
-        let weeksWithHistory = activity.weeks.drop(while: { $0.recordedDays == 0 })
-        let weeks = activity.weeks.suffix(max(5, weeksWithHistory.count))
-        return GeometryReader { geometry in
-            let visibleWeeks = min(4, max(2, Int(geometry.size.width / 120)))
-            let weekWidth = geometry.size.width / CGFloat(visibleWeeks)
-            ScrollViewReader { scroll in
-                ScrollView(.horizontal) {
-                    LazyHStack(alignment: .top, spacing: 0) {
-                        ForEach(weeks) { week in
-                            weekColumn(week, width: weekWidth)
-                        }
-                    }
-                }
-                .scrollIndicators(.visible, axes: .horizontal)
-                .task(id: weeks.last?.id) {
-                    if let latest = weeks.last {
-                        scroll.scrollTo(latest.id, anchor: .trailing)
-                    }
-                }
-            }
-        }
-    }
-
-    private func monthLabel(_ label: String?, width: CGFloat) -> some View {
+    private func monthLabel(_ label: String?) -> some View {
         Text(label ?? " ")
             .font(.system(size: 10))
             .foregroundStyle(.secondary)
             .fixedSize()
-            .frame(width: width, alignment: .leading)
+            .frame(width: cellSize, alignment: .leading)
             .accessibilityHidden(label == nil)
     }
 
@@ -359,7 +406,7 @@ private struct TokenActivityChart: View {
                 modeButton(option)
             }
         }
-        .padding(3)
+        .padding(2)
         .background(isDark ? Color(hex: 0x202022) : Color(hex: 0xF1F2F5), in: Capsule())
         .overlay { Capsule().strokeBorder(.primary.opacity(0.06), lineWidth: 1) }
     }
@@ -367,13 +414,14 @@ private struct TokenActivityChart: View {
     private func modeButton(_ option: Mode) -> some View {
         let selected = mode == option
         return Button {
+            hovered = nil
             mode = option
         } label: {
             Text(option.rawValue)
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(selected ? Color.primary : Color.secondary)
                 .padding(.horizontal, 9)
-                .frame(height: 25)
+                .frame(height: 21)
                 .background(selected ? Color.primary.opacity(0.1) : Color.clear, in: Capsule())
         }
         .buttonStyle(.plain)
@@ -388,69 +436,92 @@ private struct TokenActivityChart: View {
                 for: mode == .cumulative ? day.cumulative : count,
                 peak: mode == .cumulative ? activity.total : activity.peakDay
             ) : 0
-            let label = dayLabel(day)
-            RoundedRectangle(cornerRadius: 3)
-                .fill(level == 0 ? neutral : Color(hex: (isDark ? Self.darkLevels : Self.lightLevels)[level - 1]))
-                .overlay {
-                    if level == 0 { RoundedRectangle(cornerRadius: 3).strokeBorder(.primary.opacity(0.04), lineWidth: 0.5) }
-                }
-                .frame(width: cellSize, height: cellSize)
-                .help(label)
-                .accessibilityLabel(label)
+            activityCell(title: day.key, detail: dayDetail(day)) {
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(level == 0 ? neutral : Color(hex: (isDark ? Self.darkLevels : Self.lightLevels)[level - 1]))
+                    .overlay {
+                        if level == 0 { RoundedRectangle(cornerRadius: 3).strokeBorder(.primary.opacity(0.04), lineWidth: 0.5) }
+                    }
+                    .frame(width: cellSize, height: cellSize)
+            }
         } else {
             Color.clear.frame(width: cellSize, height: cellSize).accessibilityHidden(true)
         }
     }
 
-    private func dayLabel(_ day: TokenActivityCalendar.Day) -> String {
-        let detail = day.usage.map { DailyNumberStyle.exact.format($0.total) + " token" } ?? "暂无记录"
+    private func dayDetail(_ day: TokenActivityCalendar.Day) -> String {
         if mode == .cumulative {
-            return "截至 \(day.key) · 累计 \(DailyNumberStyle.exact.format(day.cumulative)) token · 当日\(detail)"
+            return "累计 \(DailyNumberStyle.exact.format(day.cumulative)) token"
         }
-        return "\(day.key) · \(detail)"
+        return day.usage.map { "当日 \(DailyNumberStyle.exact.format($0.total)) token" } ?? "暂无记录"
     }
 
-    private func weekColumn(_ week: TokenActivityCalendar.Week, width: CGFloat) -> some View {
-        let barHeight = week.total > 0
-            ? max(5, gridHeight * Double(week.total) / Double(max(1, activity.peakWeek))) : 0
+    private func weekBar(_ week: TokenActivityCalendar.Week) -> some View {
         let dates = week.dates
         let first = dates.first ?? ""
         let last = dates.last ?? first
         let span = first == last ? first : "\(first) 至 \(last)"
-        let shortSpan = first == last ? shortDate(first) : "\(shortDate(first))–\(shortDate(last))"
-        let label = week.recordedDays == 0 ? "\(span) · 暂无记录"
-            : "\(span) · \(DailyNumberStyle.exact.format(week.total)) token · \(week.recordedDays) 个记录日"
-        return VStack(spacing: 6) {
-            Text(week.recordedDays == 0 ? "–" : numberStyle.format(week.total))
-                .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
-                .padding(.horizontal, 4)
-                .frame(height: 16)
-            ZStack(alignment: .bottom) {
-                RoundedRectangle(cornerRadius: 5)
-                    .fill(.primary.opacity(isDark ? 0.07 : 0.05))
-                if barHeight > 0 {
-                    RoundedRectangle(cornerRadius: 5)
-                        .fill(Color(hex: isDark ? 0x58B5FF : 0x0A84FF))
-                        .frame(height: barHeight)
+        let detail = week.recordedDays == 0 ? "暂无记录" : "本周 \(DailyNumberStyle.exact.format(week.total)) token"
+        return activityCell(title: span, detail: detail) {
+            Color.clear
+                .frame(width: cellSize, height: gridHeight)
+                .overlay(alignment: .bottom) {
+                    if week.total > 0 {
+                        let height = max(4, (gridHeight - 8) * Double(week.total) / Double(activity.peakWeek))
+                        RoundedRectangle(cornerRadius: 3)
+                            .fill(Color(hex: isDark ? 0x58B5FF : 0x0A84FF))
+                            .frame(height: height)
+                    }
                 }
-            }
-            .frame(width: min(86, width * 0.65), height: gridHeight)
-            Text(shortSpan)
-                .font(.system(size: 11).monospacedDigit())
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
         }
-        .frame(width: width)
-        .contentShape(Rectangle())
-        .help(label)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(label)
     }
 
-    private func shortDate(_ key: String) -> String {
-        key.split(separator: "-").dropFirst().compactMap { Int($0) }.map { String($0) }.joined(separator: "/")
+    private func activityCell<Content: View>(
+        title: String, detail: String, @ViewBuilder content: () -> Content
+    ) -> some View {
+        content()
+            .contentShape(Rectangle())
+            .onContinuousHover(coordinateSpace: .named(timelineSpace)) { phase in
+                switch phase {
+                case let .active(location):
+                    hovered = HoveredActivity(title: title, detail: detail, location: location)
+                case .ended:
+                    if hovered?.title == title { hovered = nil }
+                }
+            }
+            .onTapGesture(coordinateSpace: .named(timelineSpace)) { location in
+                hovered = HoveredActivity(title: title, detail: detail, location: location)
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("\(title) · \(detail)")
+    }
+
+    private var hoverTooltip: some View {
+        GeometryReader { geometry in
+            if let hovered {
+                let width = min(196, max(0, geometry.size.width - 8))
+                let center = width / 2 + 4
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(hovered.title)
+                        .font(.system(size: 10).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    Text(hovered.detail)
+                        .font(.system(size: 12, weight: .semibold).monospacedDigit())
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .frame(width: width, alignment: .leading)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 7))
+                .overlay { RoundedRectangle(cornerRadius: 7).strokeBorder(.primary.opacity(0.12)) }
+                .shadow(color: .black.opacity(0.12), radius: 5, y: 2)
+                .position(
+                    x: min(max(hovered.location.x, center), geometry.size.width - center),
+                    y: hovered.location.y + (hovered.location.y < 54 ? 32 : -32)
+                )
+            }
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 }
 

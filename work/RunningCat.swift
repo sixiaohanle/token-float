@@ -19,12 +19,7 @@ struct RunningCat: View {
         TimelineView(.animation(minimumInterval: 1.0 / 60, paused: !animate)) { _ in
             let time = ProcessInfo.processInfo.systemUptime
             let pose = request.reduceMotion ? .rest : playback.pose(at: time)
-            Canvas { context, size in
-                let frame = KittenFrames.draw(in: context, size: size, pose: pose)
-                if case .run = pose, let frame {
-                    KittenFPSProbe.shared?.record(frame)
-                }
-            }
+            KittenFrames.picture(for: pose)
         }
         .frame(width: 38, height: 27)
         .task(id: request) { await apply(request) }
@@ -68,8 +63,7 @@ struct KittenPlayback {
         let start: TimeInterval
         let cadence: Double
 
-        // The authored bridges cover 0.44 cycles with quadratic ease. This
-        // duration matches their stride velocity to the loop at the seam.
+        // Let slower strides take longer to leave or return to the resting pose.
         var duration: TimeInterval { 0.88 / cadence }
         var end: TimeInterval { start + duration }
 
@@ -172,21 +166,34 @@ private enum KittenFrames {
         var frameCount: Int
     }
 
-    private struct Frame {
-        var image: Image
-        var aspect: CGFloat
-    }
-
     private static let run = load("KittenRun60", side: 8)
     private static let start = load("KittenStart60", side: 8)
-    private static let stop = load("KittenStop60", side: 8)
+    // The stop atlas is the start atlas in reverse, pixel for pixel.
+    private static let stop = Array(start.reversed())
+    private static let rest: [Image] = {
+        let standalone = load("KittenRest", side: 1)
+        return standalone.isEmpty ? start.first.map { [$0] } ?? [] : standalone
+    }()
 
-    static func draw(in context: GraphicsContext, size: CGSize, pose: KittenPlayback.Pose) -> Position? {
-        let frames: [Frame]
+    @ViewBuilder
+    static func picture(for pose: KittenPlayback.Pose) -> some View {
+        if let (frame, position) = selection(for: pose) {
+            let image = frame.resizable().interpolation(.low).aspectRatio(contentMode: .fit)
+            if case .run = pose, let probe = KittenFPSProbe.shared {
+                // Count frame changes delivered to the view, not discarded timeline ticks.
+                image.onChange(of: position) { probe.record($0) }
+            } else {
+                image
+            }
+        }
+    }
+
+    private static func selection(for pose: KittenPlayback.Pose) -> (Image, Position)? {
+        let frames: [Image]
         let progress: Double
         let wraps: Bool
         switch pose {
-        case .rest: (frames, progress, wraps) = (start, 0, false)
+        case .rest: (frames, progress, wraps) = (rest, 0, false)
         case .start(let value): (frames, progress, wraps) = (start, value, false)
         case .run(let cycles): (frames, progress, wraps) = (run, cycles - cycles.rounded(.down), true)
         case .stop(let value): (frames, progress, wraps) = (stop, value, false)
@@ -194,18 +201,10 @@ private enum KittenFrames {
         guard !frames.isEmpty else { return nil }
         let intervals = wraps ? frames.count : frames.count - 1
         let index = Int((progress * Double(intervals)).rounded()) % frames.count
-        let frame = frames[index]
-        let width = min(size.width, size.height * frame.aspect)
-        let height = width / frame.aspect
-        let bounds = CGRect(
-            x: (size.width - width) / 2, y: (size.height - height) / 2,
-            width: width, height: height
-        )
-        context.draw(frame.image, in: bounds)
-        return Position(index: index, frameCount: frames.count)
+        return (frames[index], Position(index: index, frameCount: frames.count))
     }
 
-    private static func load(_ name: String, side: Int) -> [Frame] {
+    private static func load(_ name: String, side: Int) -> [Image] {
         guard let url = Bundle.main.url(forResource: name, withExtension: "png"),
               let source = CGImageSourceCreateWithURL(url as CFURL, nil),
               let image = CGImageSourceCreateImageAtIndex(
@@ -215,15 +214,12 @@ private enum KittenFrames {
               image.width.isMultiple(of: side), image.height.isMultiple(of: side) else { return [] }
         let width = image.width / side
         let height = image.height / side
-        var frames: [Frame] = []
+        var frames: [Image] = []
         for row in 0..<side {
             for column in 0..<side {
                 let cell = CGRect(x: column * width, y: row * height, width: width, height: height)
                 guard let crop = image.cropping(to: cell) else { return [] }
-                frames.append(Frame(
-                    image: Image(decorative: crop, scale: 1),
-                    aspect: CGFloat(width) / CGFloat(height)
-                ))
+                frames.append(Image(decorative: crop, scale: 1))
             }
         }
         return frames

@@ -7,6 +7,7 @@
 !/work/DetailSessionScroll.swift
 !/work/GenerateIcon.swift
 !/work/GitHubUpdateChecker.swift
+!/work/LocalUsageLedger.swift
 !/work/MeterApplication.swift
 !/work/MeterSettings.swift
 !/work/ProviderModels.swift
@@ -20,6 +21,10 @@
 !/work/assets/KittenRun60.png
 !/work/assets/KittenStart60.png
 !/work/assets/KittenStop60.png
+!/work/assets/KittenRest.png
 !/work/update-check/
 /work/update-check/*
 !/work/update-check/main.swift
+!/work/ledger-check/
+/work/ledger-check/*
+!/work/ledger-check/main.swift

@@ -5,6 +5,8 @@ private let claudeFinishedAge: TimeInterval = 120
 private let claudeSpeedAge: TimeInterval = 20
 private let claudeReadSize = 512 * 1024
 private let claudeTailSize = 1024 * 1024
+private let claudeUsageLineLimit = 8 * 1024 * 1024
+private let claudeUsageEventName = Data("\"assistant\"".utf8)
 private let claudeEventNames = [
     "assistant", "api-request", "user", "system", "custom-title", "relocated", "model"
 ].map { Data("\"\($0)\"".utf8) }
@@ -12,9 +14,13 @@ private let claudeFinishedReasons: Set<String> = ["end_turn", "stop_sequence", "
 private let claudeTerminalEvents: Set<String> = ["turn_duration", "interrupted", "cancelled", "canceled"]
 private let claudeModelEvents: Set<String> = ["model_changed", "model_change", "model_switch", "model_switched"]
 
-private struct ClaudeResponse {
+private struct ClaudeResponse: Equatable {
     var time: Date
     var tokens: Int64
+
+    func merging(_ response: Self) -> Self {
+        Self(time: min(time, response.time), tokens: max(tokens, response.tokens))
+    }
 }
 
 private struct ClaudeSpeed {
@@ -31,6 +37,7 @@ private final class ClaudeTranscript {
     var root: String
     var modified: Date
     var identity: NSObject?
+    var liveIdentity: LiveLogFileStatus.Identity?
     var offset: UInt64 = 0
     var pending = Data()
     var droppingLine = false
@@ -50,14 +57,16 @@ private final class ClaudeTranscript {
     var modelAt: Date?
     var outputAt: Date?
     var responses: [String: ClaudeResponse] = [:]
+    var changedResponses: Set<String>?
 
-    init(url: URL, modified: Date) {
+    init(url: URL, modified: Date, trackChanges: Bool = false) {
         session = url.deletingPathExtension().lastPathComponent.lowercased()
         let parent = url.deletingLastPathComponent()
         let inSubagents = parent.lastPathComponent == "subagents"
         isAgent = inSubagents || session.hasPrefix("agent-")
         root = Self.root(for: url)
         self.modified = modified
+        changedResponses = trackChanges ? [] : nil
     }
 
     static func root(for url: URL) -> String {
@@ -74,22 +83,24 @@ private final class ClaudeTranscript {
     }
 
     func consume(_ chunk: Data, meter: ClaudeCodeMeter, usageOnly: Bool) {
+        let lineLimit = usageOnly ? claudeUsageLineLimit : claudeReadSize
         var start = chunk.startIndex
         while start < chunk.endIndex {
             let newline = chunk[start...].firstIndex(of: 10)
             let end = newline ?? chunk.endIndex
             if !droppingLine {
-                if pending.isEmpty, let newline, end - start <= claudeReadSize {
+                if pending.isEmpty, let newline, end - start <= lineLimit {
                     apply(chunk[start..<newline], meter: meter, usageOnly: usageOnly)
-                } else if pending.count + end - start <= claudeReadSize {
+                } else if pending.count + end - start <= lineLimit {
                     pending.append(contentsOf: chunk[start..<end])
                     if newline != nil { apply(pending, meter: meter, usageOnly: usageOnly) }
                 } else {
+                    pending.removeAll(keepingCapacity: false)
                     droppingLine = true
                 }
             }
             guard let newline else { break }
-            pending.removeAll(keepingCapacity: true)
+            pending.removeAll(keepingCapacity: pending.count <= 64 * 1024)
             droppingLine = false
             start = chunk.index(after: newline)
         }
@@ -97,7 +108,9 @@ private final class ClaudeTranscript {
 
     private func apply(_ line: Data, meter: ClaudeCodeMeter, usageOnly: Bool) {
         let header = line.prefix(768)
-        guard claudeEventNames.contains(where: { header.range(of: $0) != nil }),
+        let relevant = usageOnly ? line.range(of: claudeUsageEventName) != nil
+            : claudeEventNames.contains(where: { header.range(of: $0) != nil })
+        guard relevant,
               let event = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any],
               let type = event["type"] as? String else { return }
         let recordedSession = (event["sessionId"] as? String)?.lowercased()
@@ -224,10 +237,20 @@ private final class ClaudeTranscript {
         let tokens = fields.compactMap { usage[$0] as? Int64 }
             .reduce(Int64(0)) { claudeSum($0, max(0, $1)) }
         guard tokens > 0 else { return }
-        let prior = responses[id]
         // All blocks of a streamed message belong to the day the response
         // was first logged. A repeat across midnight stays on its first day.
-        responses[id] = ClaudeResponse(time: min(time, prior?.time ?? time), tokens: max(tokens, prior?.tokens ?? 0))
+        let response = ClaudeResponse(time: time, tokens: tokens)
+        let previous = responses[id]
+        let updated = previous?.merging(response) ?? response
+        guard updated != previous else { return }
+        responses[id] = updated
+        changedResponses?.insert(id)
+    }
+
+    func finishUsage(meter: ClaudeCodeMeter) {
+        if !droppingLine, !pending.isEmpty {
+            apply(pending, meter: meter, usageOnly: true)
+        }
     }
 }
 
@@ -257,8 +280,12 @@ final class ClaudeCodeMeter {
     private let workspaces = WorkspacePathResolver()
     private let desktopMetadata: ClaudeDesktopMetadata?
     private var live: [URL: ClaudeTranscript] = [:]
+    private var nextLiveDiscovery = Date.distantPast
+    private var liveDiscoveryAvailable = false
     private var daily: [URL: ClaudeTranscript] = [:]
-    private var totals: [String: Int64] = [:]
+    private var pendingDailyFiles: [URL: ClaudeTranscript] = [:]
+    private var pendingDailyResponses: [String: ClaudeResponse] = [:]
+    private var pendingUsageThrough = Date.distantPast
 
     init(home: URL = ClaudeCodeMeter.claudeHome) {
         let configured = home.appendingPathComponent("projects", isDirectory: true)
@@ -270,7 +297,13 @@ final class ClaudeCodeMeter {
 
     // Use separate instances for the speed and daily sampling queues.
     func sample(now: Date = Date()) -> MeterSnapshot {
-        let available = scan(files: &live, modifiedSince: now.addingTimeInterval(-claudeActiveAge), usageOnly: false)
+        let discover = now >= nextLiveDiscovery
+        // Check known transcripts on every sample without walking the entire
+        // projects directory at the rate timer's frequency.
+        if discover { nextLiveDiscovery = now.addingTimeInterval(0.45) }
+        let sampled = scanLive(modifiedSince: now.addingTimeInterval(-claudeActiveAge), discover: discover)
+        if discover { liveDiscoveryAvailable = sampled }
+        let available = sampled && liveDiscoveryAvailable
         var groups: [String: Group] = [:]
         for file in live.values where file.started {
             var group = groups[file.root] ?? Group()
@@ -283,7 +316,7 @@ final class ClaudeCodeMeter {
         let rows: [(row: MeterRow, time: Date)] = groups.compactMap { id, group in
             let parent = group.root
             let active = parent?.endedAt == nil && group.entries.contains { $0.endedAt == nil }
-            let latestEnd = parent?.endedAt ?? group.entries.compactMap(\.endedAt).max()
+            let latestEnd = parent?.endedAt ?? group.entries.lazy.compactMap(\.endedAt).max()
             guard active || latestEnd.map({ now.timeIntervalSince($0) <= claudeFinishedAge }) == true else { return nil }
             var speeds: [String: ClaudeSpeed] = [:]
             for file in group.entries where file.endedAt == nil {
@@ -293,19 +326,22 @@ final class ClaudeCodeMeter {
             }
             let rate = active
                 ? (speeds.isEmpty ? nil : speeds.values.reduce(0) { $0 + $1.rate })
-                : parent?.speed?.rate ?? group.entries.compactMap(\.speed).max(by: { $0.time < $1.time })?.rate
+                : parent?.speed?.rate ?? group.entries.lazy.compactMap(\.speed).max(by: { $0.time < $1.time })?.rate
             let state: MeterState = active ? (rate == nil ? .waiting : .generating) : .finished
             let item = parent ?? group.entries.max(by: { $0.modified < $1.modified })
             let metadata = desktopMetadata?.sessions[id]
             let title = item?.title.isEmpty == false ? item?.title ?? "" : metadata?.title ?? ""
             let cwd = metadata?.cwd.isEmpty == false ? metadata?.cwd ?? "" : item?.cwd ?? ""
             let outputAt = item?.outputAt.flatMap { $0 <= now ? $0 : nil }
-                ?? group.entries.compactMap(\.outputAt).filter { $0 <= now }.max()
+                ?? group.entries.lazy.compactMap(\.outputAt).filter { $0 <= now }.max()
             return (MeterRow(id: id, title: title.isEmpty ? "对话 · \(id.suffix(6))" : title,
                              rate: rate, state: state, project: workspaces.project(for: cwd),
                              model: item?.model, outputAt: outputAt, averageRate: item?.averageRate), group.lastActivity)
         }
-        return MeterSnapshot(rows: rows.sorted { $0.time > $1.time }.map(\.row), sourceAvailable: available)
+        let ordered = rows.sorted { left, right in
+            left.time == right.time ? left.row.id < right.row.id : left.time > right.time
+        }
+        return MeterSnapshot(rows: ordered.map(\.row), sourceAvailable: available)
     }
 
     func sampleDaily(now: Date = Date()) -> DailyTokenSnapshot {
@@ -313,51 +349,199 @@ final class ClaudeCodeMeter {
             return DailyTokenSnapshot(total: 0, complete: false)
         }
         let cutoff = min(interval.start, now.addingTimeInterval(-claudeActiveAge))
-        let complete = scan(files: &daily, modifiedSince: cutoff, usageOnly: true)
-        var unique: [String: ClaudeResponse] = [:]
-        var byConversation: [String: [String: Int64]] = [:]
-        for transcript in daily.values {
-            unique.merge(transcript.responses) {
-                ClaudeResponse(time: min($0.time, $1.time), tokens: max($0.tokens, $1.tokens))
-            }
-            for (id, response) in transcript.responses where !transcript.isAgent && response.time <= now {
-                let before = byConversation[transcript.root]?[id] ?? 0
-                byConversation[transcript.root, default: [:]][id] = max(before, response.tokens)
-            }
-        }
-        totals = byConversation.mapValues { $0.values.reduce(0, claudeSum) }
+        let (unique, complete) = dailyResponses(modifiedSince: cutoff)
         let total = unique.values.lazy.filter { $0.time >= interval.start && $0.time <= now }
             .reduce(Int64(0)) { claudeSum($0, $1.tokens) }
         return DailyTokenSnapshot(total: total, complete: complete)
     }
 
-    func conversationTotals() -> [String: Int64] { totals }
+    func sampleUsageEvents(now: Date = Date()) -> (events: [HistoryUsageEvent], complete: Bool) {
+        let calendar = Calendar.autoupdatingCurrent
+        let start = calendar.startOfDay(for: now)
+        let yesterday = calendar.date(byAdding: .day, value: -1, to: start) ?? start
+        let (unique, complete) = dailyResponses(modifiedSince: yesterday)
+        let events = unique.compactMap { id, response -> HistoryUsageEvent? in
+            guard response.time >= yesterday, response.time <= now else { return nil }
+            return HistoryUsageEvent(id: id, time: response.time, tokens: response.tokens)
+        }
+        return (events, complete)
+    }
+
+    // The daily queue acknowledges only successful ledger transactions. Keep
+    // pending responses independently of their files until then.
+    func samplePendingUsageEvents(now: Date) -> (events: [HistoryUsageEvent], complete: Bool) {
+        let calendar = Calendar.autoupdatingCurrent
+        let start = calendar.startOfDay(for: now)
+        let yesterday = calendar.date(byAdding: .day, value: -1, to: start) ?? start
+        let complete = scanDaily(files: &pendingDailyFiles, modifiedSince: yesterday, trackChanges: true)
+        var changed: Set<String> = []
+        for transcript in pendingDailyFiles.values {
+            if let dirty = transcript.changedResponses, !dirty.isEmpty {
+                changed.formUnion(dirty)
+                transcript.changedResponses = []
+            }
+        }
+        for id in changed {
+            var merged = pendingDailyResponses[id]
+            for transcript in pendingDailyFiles.values {
+                guard let response = transcript.responses[id] else { continue }
+                merged = merged?.merging(response) ?? response
+            }
+            if let merged, merged.time >= yesterday || pendingDailyResponses[id] != nil {
+                pendingDailyResponses[id] = merged
+            }
+        }
+        pendingUsageThrough = now
+        let events = pendingDailyResponses.compactMap { id, response -> HistoryUsageEvent? in
+            guard response.time <= now else { return nil }
+            return HistoryUsageEvent(id: id, time: response.time, tokens: response.tokens)
+        }
+        return (events, complete)
+    }
+
+    func didPersistPendingUsage() {
+        pendingDailyResponses = pendingDailyResponses.filter { $0.value.time > pendingUsageThrough }
+    }
+
+    // Stream each archive file and report usage fields only. The history store
+    // deduplicates identical responses across files, including relocated logs.
+    func scanHistory(
+        through: Date,
+        shouldRead: (HistoryLogRevision) -> Bool,
+        shouldCancel: () -> Bool,
+        receive: (HistoryLogRevision, [HistoryUsageEvent]) -> Void
+    ) -> Bool {
+        guard !shouldCancel() else { return false }
+        let keys: Set<URLResourceKey> = [
+            .isRegularFileKey, .fileSizeKey, .contentModificationDateKey, .fileResourceIdentifierKey
+        ]
+        var complete = true
+        guard manager.isReadableFile(atPath: projects.path),
+              let entries = manager.enumerator(at: projects, includingPropertiesForKeys: Array(keys),
+                  options: [.skipsHiddenFiles], errorHandler: { _, _ in complete = false; return true })
+        else { return false }
+
+        var files: [HistoryLogRevision] = []
+        for case let url as URL in entries where url.pathExtension == "jsonl" {
+            if shouldCancel() { return false }
+            guard let attributes = try? url.resourceValues(forKeys: keys),
+                  let size = attributes.fileSize, size >= 0,
+                  let modified = attributes.contentModificationDate else {
+                complete = false
+                continue
+            }
+            guard attributes.isRegularFile == true else { continue }
+            let identity = (attributes.fileResourceIdentifier as? Data)?.base64EncodedString() ?? ""
+            let revision = HistoryLogRevision(url: url, modified: modified, size: UInt64(size), identity: identity)
+            if shouldRead(revision) { files.append(revision) }
+        }
+        for revision in files.sorted(by: { $0.modified > $1.modified }) {
+            if shouldCancel() { return false }
+            let imported = autoreleasepool {
+                let transcript = ClaudeTranscript(url: revision.url, modified: revision.modified)
+                guard read(revision.url, size: revision.size, into: transcript, usageOnly: true, shouldCancel: shouldCancel)
+                else { return false }
+                transcript.finishUsage(meter: self)
+                guard !shouldCancel() else { return false }
+                let events = transcript.responses.compactMap { id, response -> HistoryUsageEvent? in
+                    guard response.time <= through else { return nil }
+                    return HistoryUsageEvent(id: id, time: response.time, tokens: response.tokens)
+                }
+                receive(revision, events)
+                return true
+            }
+            complete = complete && imported
+        }
+        return complete && !shouldCancel()
+    }
+
+    private func dailyResponses(modifiedSince cutoff: Date) -> ([String: ClaudeResponse], Bool) {
+        let complete = scanDaily(files: &daily, modifiedSince: cutoff)
+        var unique: [String: ClaudeResponse] = [:]
+        for transcript in daily.values {
+            unique.merge(transcript.responses) { $0.merging($1) }
+        }
+        return (unique, complete)
+    }
 
     fileprivate func timestamp(_ value: Any?) -> Date? {
         guard let stamp = value as? String else { return nil }
         return fractional.date(from: stamp) ?? whole.date(from: stamp)
     }
 
-    private func scan(files: inout [URL: ClaudeTranscript], modifiedSince cutoff: Date, usageOnly: Bool) -> Bool {
-        let keys: [URLResourceKey] = [.contentModificationDateKey, .isRegularFileKey, .fileSizeKey, .fileResourceIdentifierKey]
+    private func scanLive(modifiedSince cutoff: Date, discover: Bool) -> Bool {
+        var available = manager.isReadableFile(atPath: projects.path)
+        guard available else {
+            live.removeAll()
+            return false
+        }
+
+        if !discover {
+            for (url, previous) in live {
+                let file = refreshLiveFile(url, previous: previous, modifiedSince: cutoff)
+                if file !== previous { live[url] = file }
+                available = available && (file?.available ?? true)
+            }
+            return available
+        }
+
+        let keys: Set<URLResourceKey> = [.contentModificationDateKey, .isRegularFileKey]
+        guard let entries = manager.enumerator(at: projects, includingPropertiesForKeys: Array(keys),
+              options: [.skipsHiddenFiles], errorHandler: { _, _ in available = false; return true }) else {
+            live.removeAll()
+            return false
+        }
+        var discovered: [URL: ClaudeTranscript] = [:]
+        discovered.reserveCapacity(live.count)
+        for case let url as URL in entries where url.pathExtension == "jsonl" {
+            guard let attributes = try? url.resourceValues(forKeys: keys),
+                  let modified = attributes.contentModificationDate else {
+                available = false
+                continue
+            }
+            guard attributes.isRegularFile == true, modified >= cutoff,
+                  let file = refreshLiveFile(url, previous: live[url], modifiedSince: cutoff) else { continue }
+            discovered[url] = file
+            available = available && file.available
+        }
+        live = discovered
+        return available
+    }
+
+    private func refreshLiveFile(_ url: URL, previous: ClaudeTranscript?, modifiedSince cutoff: Date) -> ClaudeTranscript? {
+        guard let status = LiveLogFileStatus(url), status.modified >= cutoff else { return nil }
+        var file = previous ?? ClaudeTranscript(url: url, modified: status.modified)
+        if file.offset > status.size || (file.liveIdentity != nil && file.liveIdentity != status.identity) {
+            file = ClaudeTranscript(url: url, modified: status.modified)
+        }
+        file.liveIdentity = status.identity
+        file.modified = status.modified
+        if file.offset < status.size { file.available = read(url, size: status.size, into: file, usageOnly: false) }
+        return file
+    }
+
+    private func scanDaily(
+        files: inout [URL: ClaudeTranscript], modifiedSince cutoff: Date, trackChanges: Bool = false
+    ) -> Bool {
+        let keys: Set<URLResourceKey> = [.contentModificationDateKey, .isRegularFileKey, .fileSizeKey, .fileResourceIdentifierKey]
         var available = manager.isReadableFile(atPath: projects.path)
         var candidates: [URL: (modified: Date, size: UInt64, identity: NSObject?)] = [:]
         var recentRoots: Set<String> = []
         var recentProjects: Set<URL> = []
-        guard available, let entries = manager.enumerator(at: projects, includingPropertiesForKeys: keys,
+        guard available, let entries = manager.enumerator(at: projects, includingPropertiesForKeys: Array(keys),
               options: [.skipsHiddenFiles], errorHandler: { _, _ in available = false; return true }) else {
             files.removeAll()
             return false
         }
         for case let url as URL in entries where url.pathExtension == "jsonl" {
-            guard let attributes = try? url.resourceValues(forKeys: Set(keys)),
+            guard let attributes = try? url.resourceValues(forKeys: keys),
                   let modified = attributes.contentModificationDate, let size = attributes.fileSize else {
                 available = false
                 continue
             }
-            guard attributes.isRegularFile == true, usageOnly || modified >= cutoff else { continue }
+            guard attributes.isRegularFile == true else { continue }
             candidates[url] = (modified, UInt64(size), attributes.fileResourceIdentifier as? NSObject)
-            if usageOnly && modified >= cutoff {
+            if modified >= cutoff {
                 recentRoots.insert(files[url]?.root ?? ClaudeTranscript.root(for: url))
                 let folder = url.deletingLastPathComponent()
                 let project = folder.lastPathComponent == "subagents"
@@ -375,13 +559,13 @@ final class ClaudeCodeMeter {
                 guard recentRoots.contains(root) || legacyAgent else { continue }
             }
             paths.insert(url)
-            var file = files[url] ?? ClaudeTranscript(url: url, modified: modified)
+            var file = files[url] ?? ClaudeTranscript(url: url, modified: modified, trackChanges: trackChanges)
             if file.offset > size || (file.identity != nil && file.identity != identity) {
-                file = ClaudeTranscript(url: url, modified: modified)
+                file = ClaudeTranscript(url: url, modified: modified, trackChanges: trackChanges)
             }
             file.identity = identity
             file.modified = modified
-            if file.offset < size { file.available = read(url, size: size, into: file, usageOnly: usageOnly) }
+            if file.offset < size { file.available = read(url, size: size, into: file, usageOnly: true) }
             files[url] = file
             available = available && file.available
         }
@@ -389,7 +573,9 @@ final class ClaudeCodeMeter {
         return available
     }
 
-    private func read(_ url: URL, size: UInt64, into file: ClaudeTranscript, usageOnly: Bool) -> Bool {
+    private func read(
+        _ url: URL, size: UInt64, into file: ClaudeTranscript, usageOnly: Bool, shouldCancel: () -> Bool = { false }
+    ) -> Bool {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
         defer { try? handle.close() }
         do {
@@ -399,10 +585,15 @@ final class ClaudeCodeMeter {
             }
             try handle.seek(toOffset: file.offset)
             while file.offset < size {
+                if shouldCancel() { return false }
                 let count = Int(min(size - file.offset, UInt64(claudeReadSize)))
-                guard let data = try handle.read(upToCount: count), !data.isEmpty else { return false }
-                file.consume(data, meter: self, usageOnly: usageOnly)
-                file.offset += UInt64(data.count)
+                let readChunk = try autoreleasepool {
+                    guard let data = try handle.read(upToCount: count), !data.isEmpty else { return false }
+                    file.consume(data, meter: self, usageOnly: usageOnly)
+                    file.offset += UInt64(data.count)
+                    return true
+                }
+                guard readChunk else { return false }
             }
             return true
         } catch {

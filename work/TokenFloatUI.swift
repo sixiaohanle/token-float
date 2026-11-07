@@ -30,7 +30,7 @@ final class TokenFloatController {
         )
     }()
 
-    private static let compactSizeWithCat = NSSize(width: 107, height: 32)
+    private static let compactSizeWithCat = NSSize(width: 114, height: 32)
     private static let compactSizeWithoutCat = NSSize(width: 70, height: 32)
     private static let defaultExpandedSize = NSSize(width: 336, height: 484)
     private static let minimumExpandedSize = NSSize(width: 280, height: 380)
@@ -75,9 +75,11 @@ final class TokenFloatController {
     func setVisible(_ visible: Bool) {
         if visible {
             start()
+            if panel.contentView == nil { rebuildContent() }
             panel.orderFrontRegardless()
         } else {
             panel.orderOut(nil)
+            panel.contentView = nil
         }
     }
 
@@ -420,13 +422,7 @@ private final class MeterViewModel: ObservableObject {
         }
         let unchanged = providers.elementsEqual(next) { before, after in
             before.provider == after.provider && before.daily == after.daily &&
-                before.snapshot.sourceAvailable == after.snapshot.sourceAvailable &&
-                before.snapshot.rows.elementsEqual(after.snapshot.rows) { left, right in
-                    left.id == right.id && left.title == right.title &&
-                        left.rate == right.rate && left.state == right.state &&
-                        left.model == right.model && left.outputAt == right.outputAt &&
-                        left.averageRate == right.averageRate && left.totalTokens == right.totalTokens
-                }
+                before.snapshot == after.snapshot
         }
         if !unchanged { providers = next }
     }
@@ -443,8 +439,10 @@ private final class MeterViewModel: ObservableObject {
         )
     }
 
-    var activeRows: [MeterRow] {
-        providers.flatMap { entry in entry.snapshot.rows.filter { $0.state != .finished } }
+    var activeCount: Int {
+        providers.reduce(0) { count, entry in
+            count + entry.snapshot.rows.lazy.filter { $0.state != .finished }.count
+        }
     }
 
     var sourceAvailable: Bool {
@@ -509,22 +507,25 @@ private struct MeterFace: View {
     }
 
     private var compact: some View {
-        HStack(spacing: 6) {
+        let total = model.totalRate
+        return HStack(spacing: 0) {
             if model.showsCat {
-                RunningCat(rate: model.totalRate)
+                RunningCat(rate: total)
                     .accessibilityHidden(true)
+                Spacer(minLength: 6)
             }
             HStack(alignment: .firstTextBaseline, spacing: 3) {
-                Text(rate(model.totalRate, compact: true))
+                Text(rate(total, compact: true))
                     .font(.system(size: 13, weight: .semibold, design: .monospaced))
                     .lineLimit(1)
-                    .frame(width: 34, alignment: .trailing)
+                    .minimumScaleFactor(0.75)
                 Text("T/s")
                     .font(.system(size: 9, weight: .medium, design: .monospaced))
                     .foregroundStyle(secondary)
-                    .frame(width: 18, alignment: .leading)
+                    .fixedSize()
             }
         }
+        .padding(.horizontal, 9)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .accessibilityElement(children: .combine)
         .overlay(alignment: .topTrailing) {
@@ -637,7 +638,7 @@ private struct MeterFace: View {
     private var activity: String {
         if model.providers.isEmpty { return "未启用来源" }
         guard model.sourceAvailable else { return "会话不可读" }
-        let count = model.activeRows.count
+        let count = model.activeCount
         return count == 0 ? "当前空闲" : "\(count) 个活跃对话"
     }
 
@@ -670,7 +671,7 @@ private struct MeterFace: View {
     private func rows(width: CGFloat) -> some View {
         let providers = model.detailProviders
         let wide = width >= 410
-        let rateWidth = min(wide ? 140 : 101, max(85, width * 0.34))
+        let rateWidth: CGFloat = 84
         return DetailSessionScroll {
             LazyVStack(alignment: .leading, spacing: 12) {
                 ForEach(providers) { entry in
@@ -802,12 +803,6 @@ private struct MeterFace: View {
                         .foregroundStyle(secondary)
                         .fixedSize()
                 }
-                Text(row.totalTokens.map { "\($0.formatted(.number)) token" } ?? " ")
-                    .font(.system(size: 9, weight: .medium, design: .monospaced))
-                    .foregroundStyle(secondary)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.72)
-                    .help("当前对话累计 · 输入 + 输出")
             }
             .frame(width: rateWidth, alignment: .trailing)
         }

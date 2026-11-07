@@ -8,20 +8,28 @@ struct DailyTokenSnapshot: Equatable {
 private struct UsageTurn: Hashable {
     var thread: String
     var turn: String
+
+    var historyGroup: String { "\(thread.utf8.count):\(thread)\(turn)" }
 }
 
 private struct UsageKey: Hashable {
     var thread: String
     var event: String
+
+    var historyID: String { "\(thread.utf8.count):\(thread)\(event)" }
 }
 
-private struct RecordedUsage {
+private struct RecordedUsage: Equatable {
     var turn: UsageTurn
     var tokens: Int64
     var time: Date
+    var supersededTurns: Set<UsageTurn> = []
 
     func merged(with other: RecordedUsage) -> RecordedUsage {
-        RecordedUsage(turn: turn, tokens: max(tokens, other.tokens), time: min(time, other.time))
+        RecordedUsage(
+            turn: turn, tokens: max(tokens, other.tokens), time: min(time, other.time),
+            supersededTurns: supersededTurns.union(other.supersededTurns)
+        )
     }
 }
 
@@ -39,6 +47,8 @@ private final class DailyUsageFile {
     var thread: String
     var turn = ""
     var sourceOrdinal: Int?
+    var forkStart: Date?
+    var inheritedTurn = false
     var hasMetadata = false
     var cumulative: Int64?
     var pending = Data()
@@ -46,6 +56,9 @@ private final class DailyUsageFile {
     var modernTurns: Set<UsageTurn> = []
     var responses: [UsageKey: RecordedUsage] = [:]
     var legacy: [UsageKey: RecordedUsage] = [:]
+    private var pendingSince: Date?
+    private var pendingResponses: Set<UsageKey> = []
+    private var pendingLegacy: Set<UsageKey> = []
 
     init(url: URL) {
         compressed = url.pathExtension == "zst"
@@ -53,29 +66,35 @@ private final class DailyUsageFile {
         thread = String(rollout.deletingPathExtension().lastPathComponent.suffix(36))
     }
 
-    func consume(_ chunk: Data, day: DateInterval, clock: UsageClock) {
-        var start = chunk.startIndex
-        while start < chunk.endIndex {
-            let newline = chunk[start...].firstIndex(of: 10)
-            let end = newline ?? chunk.endIndex
-            if !droppingLine {
-                if pending.isEmpty, let newline, end - start <= dailyLineLimit {
-                    apply(chunk[start..<newline], day: day, clock: clock)
-                } else if pending.count + end - start <= dailyLineLimit {
-                    pending.append(contentsOf: chunk[start..<end])
-                    if newline != nil { apply(pending, day: day, clock: clock) }
-                } else {
-                    droppingLine = true
+    func consume(_ chunk: Data, before end: Date, clock: UsageClock) {
+        chunk.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
+            guard let base = bytes.baseAddress else { return }
+            var offset = 0
+            while offset < bytes.count {
+                let newline = memchr(base.advanced(by: offset), 10, bytes.count - offset)
+                let lineEnd = newline.map { base.distance(to: UnsafeRawPointer($0)) } ?? bytes.count
+                let start = chunk.startIndex + offset
+                let stop = chunk.startIndex + lineEnd
+                if !droppingLine {
+                    if pending.isEmpty, newline != nil, lineEnd - offset <= dailyLineLimit {
+                        apply(chunk[start..<stop], before: end, clock: clock)
+                    } else if pending.count + lineEnd - offset <= dailyLineLimit {
+                        pending.append(contentsOf: chunk[start..<stop])
+                        if newline != nil { apply(pending, before: end, clock: clock) }
+                    } else {
+                        droppingLine = true
+                        pending.removeAll()
+                    }
                 }
+                guard newline != nil else { break }
+                pending.removeAll(keepingCapacity: pending.count <= 16 * 1024)
+                droppingLine = false
+                offset = lineEnd + 1
             }
-            guard let newline else { break }
-            pending.removeAll(keepingCapacity: true)
-            droppingLine = false
-            start = chunk.index(after: newline)
         }
     }
 
-    private func apply(_ line: Data, day: DateInterval, clock: UsageClock) {
+    private func apply(_ line: Data, before end: Date, clock: UsageClock) {
         let header = line.prefix(384)
         guard dailyHeaders.contains(where: { header.range(of: $0) != nil }),
               let event = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any],
@@ -86,7 +105,11 @@ private final class DailyUsageFile {
             guard !hasMetadata else { return }
             hasMetadata = true
             thread = payload["id"] as? String ?? thread
-            sourceOrdinal = payload["subagent_history_start_ordinal"] as? Int
+            sourceOrdinal = (payload["subagent_history_start_ordinal"] as? Int)
+                ?? (payload["forked_from_ordinal_exclusive"] as? Int)
+            if sourceOrdinal == nil, payload["forked_from_id"] != nil, let stamp = event["timestamp"] as? String {
+                forkStart = clock.parse(stamp)
+            }
             return
         }
         let ordinal = event["ordinal"] as? Int
@@ -94,20 +117,29 @@ private final class DailyUsageFile {
         let name = payload["type"] as? String
         if type == "event_msg", name == "task_started" || name == "turn_started" {
             turn = payload["turn_id"] as? String ?? turn
+            // Older forks copied prior turns and rewrote the event timestamp, while
+            // retaining the original Unix start time in the lifecycle payload.
+            if let forkStart, let startedAt = payload["started_at"] as? Double {
+                inheritedTurn = startedAt < floor(forkStart.timeIntervalSince1970)
+            }
             return
         }
-        guard let stamp = event["timestamp"] as? String, let time = clock.parse(stamp), time < day.end else { return }
+        guard let stamp = event["timestamp"] as? String, let time = clock.parse(stamp), time < end else { return }
 
         if type == "token_usage_record" {
             if let owner = payload["thread_id"] as? String, owner != thread { return }
             guard let tokens = Self.total(payload["usage"]) else { return }
             let usageTurn = UsageTurn(thread: thread, turn: payload["turn_id"] as? String ?? turn)
-            modernTurns.insert(usageTurn)
-            modernTurns.insert(UsageTurn(thread: thread, turn: turn))
+            let supersededTurns: Set = [usageTurn, UsageTurn(thread: thread, turn: turn)]
+            modernTurns.formUnion(supersededTurns)
             let id = payload["response_id"] as? String ?? "\(stamp):\(ordinal ?? 0)"
             let key = UsageKey(thread: thread, event: id)
-            let usage = RecordedUsage(turn: usageTurn, tokens: tokens, time: time)
-            responses[key] = responses[key]?.merged(with: usage) ?? usage
+            let usage = RecordedUsage(turn: usageTurn, tokens: tokens, time: time, supersededTurns: supersededTurns)
+            let updated = responses[key]?.merged(with: usage) ?? usage
+            if responses[key] != updated {
+                responses[key] = updated
+                if let pendingSince, updated.time >= pendingSince { pendingResponses.insert(key) }
+            }
             return
         }
 
@@ -121,11 +153,64 @@ private final class DailyUsageFile {
         let delta = min(change, batch ?? change)
         let usageTurn = UsageTurn(thread: thread, turn: turn)
         // Legacy snapshots can lag or use a different cumulative counter.
-        guard delta > 0, !modernTurns.contains(usageTurn) else { return }
+        guard delta > 0, !inheritedTurn else { return }
 
         // Older logs can be copied verbatim when a session is archived.
         let key = UsageKey(thread: thread, event: "\(stamp):\(total)")
-        legacy[key] = RecordedUsage(turn: usageTurn, tokens: delta, time: time)
+        let updated = RecordedUsage(turn: usageTurn, tokens: delta, time: time)
+        if legacy[key] != updated {
+            legacy[key] = updated
+            if let pendingSince, time >= pendingSince { pendingLegacy.insert(key) }
+        }
+    }
+
+    func historyEvents(since start: Date = .distantPast) -> [HistoryUsageEvent] {
+        responses.compactMap { key, usage in Self.historyEvent(key, usage, since: start, modern: true) }
+            + legacy.compactMap { key, usage in Self.historyEvent(key, usage, since: start, modern: false) }
+    }
+
+    func trackPendingUsage(since start: Date) {
+        if pendingSince == nil {
+            for (key, usage) in responses where usage.time >= start { pendingResponses.insert(key) }
+            for (key, usage) in legacy where usage.time >= start { pendingLegacy.insert(key) }
+        }
+        pendingSince = start
+    }
+
+    func takePendingUsage() -> [HistoryUsageEvent] {
+        guard let pendingSince, !pendingResponses.isEmpty || !pendingLegacy.isEmpty else { return [] }
+        defer {
+            pendingResponses.removeAll()
+            pendingLegacy.removeAll()
+        }
+        let modern = pendingResponses.compactMap { key in
+            responses[key].flatMap { Self.historyEvent(key, $0, since: pendingSince, modern: true) }
+        }
+        let fallback = pendingLegacy.compactMap { key in
+            legacy[key].flatMap { Self.historyEvent(key, $0, since: pendingSince, modern: false) }
+        }
+        return modern + fallback
+    }
+
+    private static func historyEvent(
+        _ key: UsageKey, _ usage: RecordedUsage, since start: Date, modern: Bool
+    ) -> HistoryUsageEvent? {
+        guard usage.time >= start else { return nil }
+        if modern {
+            return HistoryUsageEvent(
+                id: "response:\(key.historyID)", time: usage.time, tokens: usage.tokens,
+                supersedesLegacy: usage.supersededTurns.map(\.historyGroup).sorted()
+            )
+        }
+        return HistoryUsageEvent(
+            id: "legacy:\(key.historyID)", time: usage.time, tokens: usage.tokens, legacyGroup: usage.turn.historyGroup
+        )
+    }
+
+    func finishHistory(before end: Date, clock: UsageClock) {
+        if !droppingLine, !pending.isEmpty {
+            apply(pending, before: end, clock: clock)
+        }
     }
 
     private static func total(_ value: Any?) -> Int64? {
@@ -157,29 +242,141 @@ final class DailyTokenUsage {
     private let clock = UsageClock()
     private var day: DateInterval?
     private var files: [URL: DailyUsageFile] = [:]
-    private var totals: [String: Int64] = [:]
+    private var pendingUsageEvents: [String: HistoryUsageEvent] = [:]
 
     init(home: URL = CodexMeter.codexHome) {
         self.home = home
     }
-
-    func conversationTotals() -> [String: Int64] { totals }
 
     // Read on a separate queue so a cold scan does not delay the speed display.
     func sample(now: Date = Date()) -> DailyTokenSnapshot {
         guard let today = Calendar.autoupdatingCurrent.dateInterval(of: .day, for: now) else {
             return DailyTokenSnapshot(total: 0, complete: false)
         }
+        let cutoff = min(today.start, now.addingTimeInterval(-20 * 60))
+        let complete = refreshFiles(for: today, modifiedSince: cutoff)
+        var modernTurns: Set<UsageTurn> = []
+        var responses: [UsageKey: RecordedUsage] = [:]
+        var legacy: [UsageKey: RecordedUsage] = [:]
+        for file in files.values {
+            modernTurns.formUnion(file.modernTurns)
+            responses.merge(file.responses) { $0.merged(with: $1) }
+            legacy.merge(file.legacy) { $0.merged(with: $1) }
+        }
+
+        var total: Int64 = 0
+        for usage in responses.values where usage.time >= today.start {
+            total = Self.adding(total, usage.tokens)
+        }
+        for usage in legacy.values where usage.time >= today.start && !modernTurns.contains(usage.turn) {
+            total = Self.adding(total, usage.tokens)
+        }
+        return DailyTokenSnapshot(total: total, complete: complete)
+    }
+
+    func sampleUsageEvents(now: Date) -> (events: [HistoryUsageEvent], complete: Bool) {
+        let calendar = Calendar.autoupdatingCurrent
+        guard let today = calendar.dateInterval(of: .day, for: now),
+              let yesterday = calendar.date(byAdding: .day, value: -1, to: today.start) else {
+            return ([], false)
+        }
+        let complete = refreshFiles(for: today, modifiedSince: yesterday)
+        return (files.values.filter(\.readable).flatMap { $0.historyEvents(since: yesterday) }, complete)
+    }
+
+    // The serial daily sampler retains deltas across log rotation or midnight
+    // until their SQLite transaction succeeds.
+    func samplePendingUsageEvents(now: Date) -> (events: [HistoryUsageEvent], complete: Bool) {
+        let calendar = Calendar.autoupdatingCurrent
+        guard let today = calendar.dateInterval(of: .day, for: now),
+              let yesterday = calendar.date(byAdding: .day, value: -1, to: today.start) else {
+            return (Array(pendingUsageEvents.values), false)
+        }
+        let complete = refreshFiles(for: today, modifiedSince: yesterday, pendingSince: yesterday)
+        for file in files.values where file.readable {
+            for event in file.takePendingUsage() {
+                if let pending = pendingUsageEvents[event.id] {
+                    pendingUsageEvents[event.id] = HistoryUsageEvent(
+                        id: event.id, time: min(pending.time, event.time), tokens: max(pending.tokens, event.tokens),
+                        legacyGroup: pending.legacyGroup ?? event.legacyGroup,
+                        supersedesLegacy: Set(pending.supersedesLegacy).union(event.supersedesLegacy).sorted()
+                    )
+                } else {
+                    pendingUsageEvents[event.id] = event
+                }
+            }
+        }
+        return (Array(pendingUsageEvents.values), complete)
+    }
+
+    func didPersistPendingUsage() {
+        pendingUsageEvents.removeAll()
+    }
+
+    // Historical reads use independent cursors and only publish files that were fully read.
+    func scanHistory(
+        through: Date,
+        shouldRead: (HistoryLogRevision) -> Bool,
+        shouldCancel: () -> Bool,
+        receive: (HistoryLogRevision, [HistoryUsageEvent]) -> Void
+    ) -> Bool {
+        guard let end = Calendar.autoupdatingCurrent.dateInterval(of: .day, for: through)?.end else {
+            return false
+        }
+        let inventory = inventory(modifiedSince: .distantPast)
+        var complete = inventory.complete
+        for revision in inventory.revisions.sorted(by: { $0.modified > $1.modified }) {
+            if shouldCancel() { return false }
+            guard shouldRead(revision) else { continue }
+            let imported = autoreleasepool {
+                let file = DailyUsageFile(url: revision.url)
+                guard read(revision, into: file, before: end, shouldCancel: shouldCancel) else { return false }
+                file.finishHistory(before: end, clock: clock)
+                receive(revision, file.historyEvents())
+                return true
+            }
+            complete = complete && imported
+        }
+        return complete && !shouldCancel()
+    }
+
+    private func refreshFiles(for today: DateInterval, modifiedSince cutoff: Date, pendingSince: Date? = nil) -> Bool {
         if day != today {
             day = today
             files.removeAll()
         }
-        let cutoff = min(today.start, now.addingTimeInterval(-20 * 60))
+        let inventory = inventory(modifiedSince: cutoff)
+        var complete = inventory.complete
+        for revision in inventory.revisions {
+            let url = revision.url
+            var file = files[url] ?? DailyUsageFile(url: url)
+            let identity = revision.identity as NSString
+            let replaced = file.identity != nil && identity != file.identity
+            let rewritten = file.offset == revision.size && file.modified != revision.modified
+            if replaced || rewritten || (file.compressed && (file.modified != revision.modified || !file.readable))
+                || file.offset > revision.size {
+                file = DailyUsageFile(url: url)
+            }
+            files[url] = file
+            file.identity = identity
+            if let pendingSince { file.trackPendingUsage(since: pendingSince) }
+            if file.compressed ? !file.finished : file.offset < revision.size {
+                file.readable = read(revision, into: file, before: today.end, shouldCancel: { false })
+            }
+            file.modified = revision.modified
+            complete = complete && file.readable
+        }
+        return complete
+    }
 
+    private func inventory(modifiedSince cutoff: Date) -> (revisions: [HistoryLogRevision], complete: Bool) {
+        var revisions: [HistoryLogRevision] = []
         var complete = true
+        var foundDirectory = false
         for directory in ["sessions", "archived_sessions"] {
             let root = home.appendingPathComponent(directory, isDirectory: true)
-            if !fileManager.fileExists(atPath: root.path), directory == "archived_sessions" { continue }
+            guard fileManager.fileExists(atPath: root.path) else { continue }
+            foundDirectory = true
             let keys: Set<URLResourceKey> = [.contentModificationDateKey, .isRegularFileKey, .fileSizeKey, .fileResourceIdentifierKey]
             guard let entries = fileManager.enumerator(
                 at: root, includingPropertiesForKeys: Array(keys), options: [.skipsHiddenFiles],
@@ -197,44 +394,11 @@ final class DailyTokenUsage {
                     continue
                 }
                 guard properties.isRegularFile == true, modified >= cutoff else { continue }
-                var file = files[url] ?? DailyUsageFile(url: url)
-                let identity = properties.fileResourceIdentifier as? NSObject
-                let replaced = file.identity != nil && identity != file.identity
-                if replaced || (file.compressed && (file.modified != modified || !file.readable)) || file.offset > UInt64(size) {
-                    file = DailyUsageFile(url: url)
-                }
-                files[url] = file
-                file.identity = identity
-                if file.compressed {
-                    if !file.finished { file.readable = readCompressed(url, into: file, day: today) }
-                } else if file.offset < UInt64(size) {
-                    file.readable = readPlain(url, through: UInt64(size), into: file, day: today)
-                }
-                file.modified = modified
-                complete = complete && file.readable
+                let identity = (properties.fileResourceIdentifier as? Data)?.base64EncodedString() ?? ""
+                revisions.append(HistoryLogRevision(url: url, modified: modified, size: UInt64(size), identity: identity))
             }
         }
-
-        var modernTurns: Set<UsageTurn> = []
-        var responses: [UsageKey: RecordedUsage] = [:]
-        var legacy: [UsageKey: RecordedUsage] = [:]
-        for file in files.values {
-            modernTurns.formUnion(file.modernTurns)
-            responses.merge(file.responses) { $0.merged(with: $1) }
-            legacy.merge(file.legacy) { $0.merged(with: $1) }
-        }
-
-        var total: Int64 = 0
-        totals.removeAll(keepingCapacity: true)
-        func count(_ usage: RecordedUsage, for key: UsageKey) {
-            totals[key.thread] = Self.adding(totals[key.thread] ?? 0, usage.tokens)
-            if usage.time >= today.start { total = Self.adding(total, usage.tokens) }
-        }
-        for (key, usage) in responses { count(usage, for: key) }
-        for (key, usage) in legacy where !modernTurns.contains(usage.turn) {
-            count(usage, for: key)
-        }
-        return DailyTokenSnapshot(total: total, complete: complete)
+        return (revisions, complete && foundDirectory)
     }
 
     private static func adding(_ total: Int64, _ delta: Int64) -> Int64 {
@@ -242,16 +406,25 @@ final class DailyTokenUsage {
         return overflow ? Int64.max : sum
     }
 
-    private func readPlain(_ url: URL, through size: UInt64, into file: DailyUsageFile, day: DateInterval) -> Bool {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+    private func read(
+        _ revision: HistoryLogRevision, into file: DailyUsageFile, before end: Date, shouldCancel: () -> Bool
+    ) -> Bool {
+        if file.compressed {
+            return readCompressed(revision.url, into: file, before: end, shouldCancel: shouldCancel)
+        }
+        guard let handle = try? FileHandle(forReadingFrom: revision.url) else { return false }
         defer { try? handle.close() }
         do {
             try handle.seek(toOffset: file.offset)
-            while file.offset < size {
-                let count = Int(min(size - file.offset, 512 * 1024))
-                guard let data = try handle.read(upToCount: count), !data.isEmpty else { return false }
-                file.consume(data, day: day, clock: clock)
-                file.offset += UInt64(data.count)
+            while file.offset < revision.size {
+                let count = Int(min(revision.size - file.offset, 512 * 1024))
+                let readChunk = try autoreleasepool {
+                    guard !shouldCancel(), let data = try handle.read(upToCount: count), !data.isEmpty else { return false }
+                    file.consume(data, before: end, clock: clock)
+                    file.offset += UInt64(data.count)
+                    return true
+                }
+                guard readChunk else { return false }
             }
             return true
         } catch {
@@ -259,7 +432,9 @@ final class DailyTokenUsage {
         }
     }
 
-    private func readCompressed(_ url: URL, into file: DailyUsageFile, day: DateInterval) -> Bool {
+    private func readCompressed(
+        _ url: URL, into file: DailyUsageFile, before end: Date, shouldCancel: () -> Bool
+    ) -> Bool {
         let search = ["/opt/homebrew/bin/zstd", "/usr/local/bin/zstd", "/usr/bin/zstd"]
         guard let executable = search.first(where: fileManager.isExecutableFile(atPath:)) else { return false }
         let process = Process()
@@ -270,8 +445,20 @@ final class DailyTokenUsage {
         process.standardError = FileHandle.nullDevice
         do {
             try process.run()
-            while let data = try output.fileHandleForReading.read(upToCount: 512 * 1024), !data.isEmpty {
-                file.consume(data, day: day, clock: clock)
+            while true {
+                if shouldCancel() {
+                    process.terminate()
+                    process.waitUntilExit()
+                    return false
+                }
+                let readChunk = try autoreleasepool {
+                    guard let data = try output.fileHandleForReading.read(upToCount: 512 * 1024), !data.isEmpty else {
+                        return false
+                    }
+                    file.consume(data, before: end, clock: clock)
+                    return true
+                }
+                if !readChunk { break }
             }
             process.waitUntilExit()
             file.finished = process.terminationStatus == 0

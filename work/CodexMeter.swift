@@ -1,11 +1,12 @@
+import Darwin
 import Foundation
 import SQLite3
 
-enum MeterState {
+enum MeterState: Equatable {
     case generating, waiting, finished
 }
 
-struct MeterRow: Identifiable {
+struct MeterRow: Equatable, Identifiable {
     var id: String
     var title: String
     var rate: Double?
@@ -14,12 +15,37 @@ struct MeterRow: Identifiable {
     var model: String?
     var outputAt: Date?
     var averageRate: Double?
-    var totalTokens: Int64?
 }
 
-struct MeterSnapshot {
+struct MeterSnapshot: Equatable {
     var rows: [MeterRow]
     var sourceAvailable: Bool
+}
+
+// Metadata for known live files is refreshed several times a second.
+// Read it directly without a Foundation resource dictionary on every poll.
+struct LiveLogFileStatus {
+    struct Identity: Equatable {
+        let device: dev_t
+        let inode: ino_t
+    }
+
+    let modified: Date
+    let size: UInt64
+    let identity: Identity
+
+    init?(_ url: URL) {
+        var status = stat()
+        let result = url.withUnsafeFileSystemRepresentation { path in
+            path.map { fstatat(AT_FDCWD, $0, &status, 0) } ?? -1
+        }
+        guard result == 0, status.st_size >= 0,
+              status.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) else { return nil }
+        modified = Date(timeIntervalSince1970: Double(status.st_mtimespec.tv_sec)
+            + Double(status.st_mtimespec.tv_nsec) / 1_000_000_000)
+        size = UInt64(status.st_size)
+        identity = Identity(device: status.st_dev, inode: status.st_ino)
+    }
 }
 
 private let freshSampleAge: TimeInterval = 20
@@ -50,7 +76,7 @@ private final class Rollout {
     var isFork = false
     var lastModified: Date
     var offset: UInt64 = 0
-    var inode: UInt64?
+    var identity: LiveLogFileStatus.Identity?
     var pending = Data()
     var skippingLine = false
     var turnID: String?
@@ -59,7 +85,6 @@ private final class Rollout {
     var cumulativeOutput: Int?
     var seenResponses: Set<String> = []
     var hasModernUsageInTurn = false
-    var conversationTokens: Int64?
     var model: String?
     var modelAt: Date?
     var outputAt: Date?
@@ -156,7 +181,6 @@ private final class Rollout {
             if let response = payload["response_id"] as? String, !seenResponses.insert(response).inserted { return }
             let total = payload["thread_token_usage"] as? [String: Any]
             cumulativeOutput = total?["output_tokens"] as? Int ?? cumulativeOutput
-            if !isFork { conversationTokens = total?["total_tokens"] as? Int64 ?? conversationTokens }
             hasModernUsageInTurn = true
             delta = output
         } else if type == "event_msg", name == "token_count", let info = payload["info"] as? [String: Any] {
@@ -168,7 +192,6 @@ private final class Rollout {
             // Modern records supply the batch directly. Their legacy copy
             // can arrive later and use a different cumulative counter.
             guard !hasModernUsageInTurn else { return }
-            if !isFork { conversationTokens = usage["total_tokens"] as? Int64 ?? conversationTokens }
             let change = previous.map { total - $0 } ?? last ?? 0
             delta = min(change, last ?? change)
         } else {
@@ -230,16 +253,18 @@ private final class Rollout {
             let newline = data[start...].firstIndex(of: 10)
             let end = newline ?? data.endIndex
             if !skippingLine {
-                if pending.count + end - start <= maxLineSize {
+                if pending.isEmpty, let newline, end - start <= maxLineSize {
+                    apply(data[start..<newline], clock: clock)
+                } else if pending.count + end - start <= maxLineSize {
                     pending.append(contentsOf: data[start..<end])
+                    if newline != nil { apply(pending, clock: clock) }
                 } else {
-                    pending.removeAll(keepingCapacity: true)
+                    pending.removeAll(keepingCapacity: false)
                     skippingLine = true
                 }
             }
             guard let newline else { break }
-            if !skippingLine { apply(pending, clock: clock) }
-            pending.removeAll(keepingCapacity: true)
+            pending.removeAll(keepingCapacity: pending.count <= 64 * 1024)
             skippingLine = false
             start = data.index(after: newline)
         }
@@ -262,6 +287,7 @@ private final class RolloutClock {
 private final class ThreadDirectory {
     private let databaseURL: URL
     private var database: OpaquePointer?
+    private var attemptedConnection = false
     private var titles: [String: String] = [:]
     private var parents: [String: String] = [:]
     private var models: [String: String] = [:]
@@ -285,6 +311,7 @@ private final class ThreadDirectory {
         parents.removeAll(keepingCapacity: true)
         models.removeAll(keepingCapacity: true)
         workspacePaths.removeAll(keepingCapacity: true)
+        attemptedConnection = false
         projectRoots = readAll("SELECT path FROM project_roots")
     }
 
@@ -320,7 +347,7 @@ private final class ThreadDirectory {
             WHERE t.id = ? ORDER BY r.position LIMIT 1
             """, id)
         let path = assignedRoot ?? metadataPath ?? read("SELECT cwd FROM threads WHERE id = ?", id) ?? ""
-        let matchingRoot = projectRoots
+        let matchingRoot = projectRoots.lazy
             .filter { path == $0 || path.hasPrefix($0 + "/") }
             .max { $0.count < $1.count }
         let project = workspaces.project(for: matchingRoot ?? path)
@@ -330,6 +357,8 @@ private final class ThreadDirectory {
 
     private func connection() -> OpaquePointer? {
         if database == nil {
+            guard !attemptedConnection else { return nil }
+            attemptedConnection = true
             var connection: OpaquePointer?
             let result = sqlite3_open_v2(databaseURL.path, &connection, SQLITE_OPEN_READONLY, nil)
             guard result == SQLITE_OK else {
@@ -410,23 +439,20 @@ final class CodexMeter {
         threads.refresh(at: now)
 
         for (url, rollout) in rollouts {
-            guard let attrs = try? fileManager.attributesOfItem(atPath: url.path),
-                  let size = (attrs[.size] as? NSNumber)?.uint64Value,
-                  let modified = attrs[.modificationDate] as? Date,
-                  now.timeIntervalSince(modified) <= activeTimeout else {
+            guard let status = LiveLogFileStatus(url),
+                  now.timeIntervalSince(status.modified) <= activeTimeout else {
                 rollouts.removeValue(forKey: url)
                 continue
             }
-            let inode = (attrs[.systemFileNumber] as? NSNumber)?.uint64Value
             var current = rollout
-            if rollout.offset > size || (rollout.inode != nil && inode != rollout.inode) {
-                current = Rollout(url: url, modified: modified)
+            if rollout.offset > status.size || (rollout.identity != nil && rollout.identity != status.identity) {
+                current = Rollout(url: url, modified: status.modified)
                 rollouts[url] = current
             }
-            current.inode = inode
-            current.lastModified = modified
-            if size > current.offset {
-                read(current, size: size)
+            current.identity = status.identity
+            current.lastModified = status.modified
+            if status.size > current.offset {
+                read(current, size: status.size)
             }
         }
 
@@ -489,8 +515,7 @@ final class CodexMeter {
                 project: threads.project(for: id, metadataPath: conversation.workspacePath),
                 model: root?.model ?? threads.model(for: id) ?? conversation.recentRunner?.model,
                 outputAt: root?.outputAt.flatMap { $0 <= now ? $0 : nil } ?? conversation.latestOutput,
-                averageRate: root?.averageRate ?? conversation.recentRunner?.averageRate,
-                totalTokens: root?.conversationTokens
+                averageRate: root?.averageRate ?? conversation.recentRunner?.averageRate
             )
         }
         return MeterSnapshot(rows: rows, sourceAvailable: true)
@@ -538,9 +563,13 @@ final class CodexMeter {
             try handle.seek(toOffset: rollout.offset)
             while rollout.offset < size {
                 let count = Int(min(64 * 1024, size - rollout.offset))
-                guard let chunk = try handle.read(upToCount: count), !chunk.isEmpty else { break }
-                rollout.consume(chunk, clock: clock)
-                rollout.offset += UInt64(chunk.count)
+                let readChunk = try autoreleasepool {
+                    guard let chunk = try handle.read(upToCount: count), !chunk.isEmpty else { return false }
+                    rollout.consume(chunk, clock: clock)
+                    rollout.offset += UInt64(chunk.count)
+                    return true
+                }
+                guard readChunk else { break }
             }
         } catch {
             // A writer may rotate or truncate the rollout between polls.

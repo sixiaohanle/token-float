@@ -13,7 +13,7 @@ app="$build_dir/$display_name.app"
 contents="$app/Contents"
 mkdir -p "$contents/MacOS" "$contents/Resources" "$output_dir"
 cp "$work_dir/assets/KittenRun60.png" "$work_dir/assets/KittenStart60.png" \
-    "$work_dir/assets/KittenStop60.png" "$contents/Resources/"
+    "$work_dir/assets/KittenRest.png" "$contents/Resources/"
 cp "$work_dir/../LICENSE" "$contents/Resources/LICENSE"
 
 xcrun swiftc "$work_dir/GenerateIcon.swift" -o "$build_dir/generate-icon"
@@ -25,7 +25,7 @@ xcrun swiftc -O -target "$architecture-apple-macosx$minimum_version" \
     "$work_dir/RunningCat.swift" "$work_dir/CodexMeter.swift" \
     "$work_dir/DailyTokenUsage.swift" "$work_dir/ClaudeCodeMeter.swift" "$work_dir/ProviderModels.swift" \
     "$work_dir/MeterSettings.swift" "$work_dir/MeterApplication.swift" "$work_dir/UsageHistory.swift" \
-    "$work_dir/GitHubUpdateChecker.swift" \
+    "$work_dir/GitHubUpdateChecker.swift" "$work_dir/LocalUsageLedger.swift" \
     -lsqlite3 -o "$contents/MacOS/TokenFloat"
 
 cat > "$contents/Info.plist" <<PLIST
@@ -50,9 +50,9 @@ cat > "$contents/Info.plist" <<PLIST
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.7.6</string>
+    <string>0.7.11</string>
     <key>CFBundleVersion</key>
-    <string>17</string>
+    <string>22</string>
     <key>LSMinimumSystemVersion</key>
     <string>$minimum_version</string>
     <key>LSUIElement</key>
