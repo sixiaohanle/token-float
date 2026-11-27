@@ -74,6 +74,7 @@ final class MeterPreferences: ObservableObject {
     @Published private(set) var placement: MeterPlacement
     @Published private(set) var dailyNumberStyle: DailyNumberStyle
     @Published private(set) var enabled: Set<MeterProvider>
+    @Published private(set) var expandedSources: Set<MeterProvider>
     @Published private(set) var overrides: [MeterProvider: URL]
     @Published private(set) var sourceStatus: [MeterProvider: String] = [:]
     @Published private(set) var loginStatus = SMAppService.Status.notRegistered
@@ -83,6 +84,7 @@ final class MeterPreferences: ObservableObject {
     var didChange: (() -> Void)?
     var didChangeShowsCat: ((Bool) -> Void)?
     var didChangeDailyNumberStyle: ((DailyNumberStyle) -> Void)?
+    var didChangeExpandedSources: ((Set<MeterProvider>) -> Void)?
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -90,6 +92,9 @@ final class MeterPreferences: ObservableObject {
         placement = defaults.string(forKey: "placement").flatMap(MeterPlacement.init(rawValue:)) ?? .both
         dailyNumberStyle = defaults.string(forKey: "dailyNumberStyle").flatMap(DailyNumberStyle.init(rawValue:)) ?? .exact
         enabled = Set(MeterProvider.allCases.filter { defaults.object(forKey: "enabled.\($0.rawValue)") as? Bool ?? true })
+        expandedSources = Set(MeterProvider.allCases.filter {
+            defaults.object(forKey: "expanded.\($0.rawValue)") as? Bool ?? true
+        })
         overrides = Dictionary(uniqueKeysWithValues: MeterProvider.allCases.compactMap { provider in
             defaults.string(forKey: "source.\(provider.rawValue)").map {
                 (provider, URL(fileURLWithPath: $0, isDirectory: true))
@@ -102,6 +107,7 @@ final class MeterPreferences: ObservableObject {
         switch provider {
         case .codex: return CodexMeter.codexHome
         case .claude: return ClaudeCodeMeter.claudeHome
+        case .antigravity: return AntigravityMeter.antigravityHome
         }
     }
 
@@ -131,6 +137,13 @@ final class MeterPreferences: ObservableObject {
         defaults.set(value, forKey: "enabled.\(provider.rawValue)")
         if value { enabled.insert(provider) } else { enabled.remove(provider) }
         didChange?()
+    }
+
+    func setExpanded(_ value: Bool, for provider: MeterProvider) {
+        guard expandedSources.contains(provider) != value else { return }
+        defaults.set(value, forKey: "expanded.\(provider.rawValue)")
+        if value { expandedSources.insert(provider) } else { expandedSources.remove(provider) }
+        didChangeExpandedSources?(expandedSources)
     }
 
     func setHome(_ url: URL?, for provider: MeterProvider) {
@@ -290,6 +303,8 @@ struct MeterSettingsView: View {
                     .frame(width: 220)
                 }
                 Rectangle().fill(separator).frame(height: 1)
+                expandedSourceSettings
+                Rectangle().fill(separator).frame(height: 1)
                 settingRow("在悬浮球显示小猫") {
                     Toggle("在悬浮球显示小猫", isOn: Binding(
                         get: { preferences.showsCat },
@@ -340,6 +355,26 @@ struct MeterSettingsView: View {
         }
     }
 
+    private var expandedSourceSettings: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text("展开面板显示的来源").font(.system(size: 13))
+            HStack(spacing: 14) {
+                ForEach(MeterProvider.allCases) { provider in
+                    Toggle(provider == .codex ? "Codex（GPT）" : provider.title, isOn: Binding(
+                        get: { preferences.expandedSources.contains(provider) },
+                        set: { preferences.setExpanded($0, for: provider) }
+                    ))
+                    .toggleStyle(.checkbox)
+                    .controlSize(.small)
+                }
+            }
+            Text("总速率和累计用量包含所有已启用的数据来源。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 10)
+    }
+
     private var about: some View {
         VStack(alignment: .leading, spacing: 12) {
             VStack(alignment: .leading, spacing: 14) {
@@ -365,7 +400,7 @@ struct MeterSettingsView: View {
                         }
                     }
                 }
-                Text("Token 悬浮球是一款 macOS 用量小工具。它从本机 Codex 和 Claude Code 会话日志读取数据，在桌面或菜单栏显示输出速率，并在本机保存每日 token 用量。")
+                Text("悬浮球和菜单栏可显示 Codex、Claude Code 和 Google Antigravity 的输出速率。每日 token 用量保存在本机。")
                     .lineSpacing(3)
                 updateStatus.font(.system(size: 11))
             }
@@ -419,7 +454,7 @@ struct MeterSettingsView: View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
                 Circle()
-                    .fill(provider == .codex ? Color(red: 0.32, green: 0.56, blue: 0.96) : Color(red: 0.25, green: 0.70, blue: 0.42))
+                    .fill(sourceColor(provider))
                     .frame(width: 7, height: 7)
                 VStack(alignment: .leading, spacing: 4) {
                     Text(provider.title).font(.system(size: 13, weight: .semibold))
@@ -458,6 +493,14 @@ struct MeterSettingsView: View {
         }
         .padding(.horizontal, 15)
         .background(cardBackground)
+    }
+
+    private func sourceColor(_ provider: MeterProvider) -> Color {
+        switch provider {
+        case .codex: Color(red: 0.32, green: 0.56, blue: 0.96)
+        case .claude: Color(red: 0.25, green: 0.70, blue: 0.42)
+        case .antigravity: Color(red: 0.62, green: 0.49, blue: 0.95)
+        }
     }
 
     private func settingsCard<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {

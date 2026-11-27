@@ -11,12 +11,13 @@ if CommandLine.arguments.contains("--check-daily") {
 if CommandLine.arguments.contains("--check-source") {
     let codex = CodexMeter().sample()
     let claude = ClaudeCodeMeter().sample()
-    for (provider, snapshot) in [(MeterProvider.codex, codex), (.claude, claude)] {
+    let antigravity = AntigravityMeter().sample()
+    for (provider, snapshot) in [(MeterProvider.codex, codex), (.claude, claude), (.antigravity, antigravity)] {
         let active = snapshot.rows.filter { $0.state != .finished }
         let sampled = active.compactMap(\.rate)
         print("\(provider.rawValue) source=\(snapshot.sourceAvailable) active=\(active.count) sampled=\(sampled.count) rate=\(sampled.reduce(0, +))")
     }
-    exit(codex.sourceAvailable || claude.sourceAvailable ? 0 : 1)
+    exit(codex.sourceAvailable || claude.sourceAvailable || antigravity.sourceAvailable ? 0 : 1)
 }
 
 @MainActor

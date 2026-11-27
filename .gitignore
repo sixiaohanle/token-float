@@ -1,6 +1,11 @@
 .DS_Store
 /outputs/
 /work/*
+!/work/AntigravityMeter.swift
+!/work/AntigravitySampleReader.swift
+!/work/antigravity-check/
+/work/antigravity-check/*
+!/work/antigravity-check/main.swift
 !/work/ClaudeCodeMeter.swift
 !/work/CodexArchiveRecovery.swift
 !/work/CodexMeter.swift

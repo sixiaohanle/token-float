@@ -2,14 +2,14 @@
 
 English · [简体中文](README.zh-CN.md)
 
-Token Float is a macOS utility for tracking how fast **Codex** and **Claude Code** generate output and how much token usage they record over time. Keep the combined rate in a small floating widget, in the menu bar, or in both places. Expand either view to see individual conversations, or open Usage Statistics to review your history.
+Token Float is a macOS utility for tracking how fast **Codex**, **Claude Code**, and **Google Antigravity** generate output. It also tracks daily and historical token usage for all three sources. Keep the combined rate in a small floating widget, in the menu bar, or in both places. Expand either view to see individual conversations, or open Usage Statistics to review your history. Click outside an open panel to close it.
 
 [Download the latest release](https://github.com/sixiaohanle/token-float/releases/latest)
 
 ## What you can see
 
 - **Live output rates.** See combined and per-provider rates in tokens per second (`T/s`). The expanded view shows recent conversations, their latest recorded model and output time when available, and an average rate for completed conversations.
-- **Today's usage and history.** View today's total and browse daily, weekly, and cumulative activity. Filter the statistics to Codex, Claude Code, or both. Hover over a day or week to see its date range and token count, or scroll the timeline left to view earlier months.
+- **Today's usage and history.** View today's total and browse daily, weekly, and cumulative activity. Filter the statistics to a single provider or view the combined total. Hover over a day or week to see its date range and token count, or scroll the timeline left to view earlier months.
 - **Display options.** Choose a floating widget, the menu bar, or both. Turn the animated cat on or off, configure launch at login, and choose full numbers or Chinese units such as `万` (10,000) and `亿` (100 million). The number format also applies to daily, weekly, and cumulative chart details.
 
 ## Install
@@ -26,9 +26,9 @@ The app interface is in Simplified Chinese. These are the labels you'll see in S
 
 | Page | What to do there |
 | --- | --- |
-| General (`常规`) | Set the display location, cat animation, number format, and launch at login. |
-| Data Sources (`数据来源`) | Enable Codex or Claude Code, choose a custom log directory, or select **Rescan** (`重新扫描`). |
-| Usage Statistics (`用量统计`) | Browse totals and charts. Use `总共` for both sources and `每日`, `每周`, or `累计` to change the chart view. |
+| General (`常规`) | Choose which providers appear when the panel opens, set the display location, cat animation, number format, and launch at login. |
+| Data Sources (`数据来源`) | Enable a provider, choose a custom log directory, or select **Rescan** (`重新扫描`). |
+| Usage Statistics (`用量统计`) | Browse totals and charts. Use `总共` for all sources and `每日`, `每周`, or `累计` to change the chart view. |
 | About (`关于`) | See the installed version, check for updates, and open the GitHub repository. |
 
 ## Data sources and accounting
@@ -37,12 +37,14 @@ The app interface is in Simplified Chinese. These are the labels you'll see in S
 | --- | --- |
 | Codex | `~/.codex/sessions` and `~/.codex/archived_sessions` |
 | Claude Code | `~/.claude/projects` |
+| Google Antigravity | `~/.gemini/antigravity/conversations/*.db` (App) and `~/.gemini/antigravity-ide/conversations/*.db` (IDE) |
 
 Token Float can use `CODEX_HOME` and `CLAUDE_CONFIG_DIR` when those environment variables are available to the app. You can also choose directories in **Data Sources**. Reading compressed Codex archives (`.jsonl.zst`) requires `zstd` at `/opt/homebrew/bin/zstd`, `/usr/local/bin/zstd`, or `/usr/bin/zstd`.
 
 Live rates estimate **output** tokens per second from the timing of local log entries. The display updates as the tools write new usage records. Historical totals use the recorded token counts and group dated usage by the Mac's local calendar.
 
 - **Codex** uses per-response usage records when available and takes increments from older cumulative records. Matching copies and identifiable inherited history are deduplicated.
+- **Antigravity** updates when the App or IDE saves a completed model response. Its rate uses that response’s output tokens divided by its recorded streaming time. The widget and menu bar include recent responses in the combined rate. Older sessions without timing metadata have no speed reading. Usage totals add recorded input, cache-read, cache-write, and output tokens. Copies of a conversation in the App and IDE are counted once. Legacy sessions stored only as `.pb` files have no readable usage counts.
 - **Claude Code** adds the reported input, cache-creation input, cache-read input, and output counts. Repeated updates for the same response are combined.
 
 After an initial backfill, Token Float continues saving newly observed usage. The local ledger retains previously recorded totals if the original logs are later removed. When a Codex archive has only a cumulative counter in the local state database, that counter contributes to the overall total. It may include inherited fork usage. Daily and weekly charts use dated records, and a restored original log replaces its corresponding fallback amount.

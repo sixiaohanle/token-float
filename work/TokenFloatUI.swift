@@ -2,6 +2,52 @@ import AppKit
 import SwiftUI
 
 @MainActor
+final class PanelOutsideClickMonitor {
+    private var local: Any?
+    private var global: Any?
+
+    func start(panel: NSPanel, toggleButton: NSView? = nil, dismiss: @escaping () -> Void) {
+        stop()
+        let clicks: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        local = NSEvent.addLocalMonitorForEvents(matching: clicks) { [weak panel, weak toggleButton] event in
+            if let panel, !Self.isInside(panel, event: event), !Self.isToggleClick(event, button: toggleButton) {
+                dismiss()
+            }
+            return event
+        }
+        global = NSEvent.addGlobalMonitorForEvents(matching: clicks) { [weak toggleButton] event in
+            if !Self.isToggleClick(event, button: toggleButton) { dismiss() }
+        }
+    }
+
+    func stop() {
+        if let local { NSEvent.removeMonitor(local) }
+        if let global { NSEvent.removeMonitor(global) }
+        local = nil
+        global = nil
+    }
+
+    private static func isInside(_ panel: NSPanel, event: NSEvent) -> Bool {
+        guard var window = event.window else {
+            return panel.frame.contains(event.cgEvent?.unflippedLocation ?? NSEvent.mouseLocation)
+        }
+        while window !== panel {
+            guard let parent = window.sheetParent ?? window.parent else { return false }
+            window = parent
+        }
+        return true
+    }
+
+    private static func isToggleClick(_ event: NSEvent, button: NSView?) -> Bool {
+        guard event.type == .leftMouseDown, let button, let window = button.window else { return false }
+        let frame = window.convertToScreen(button.convert(button.bounds, to: nil))
+        let click = event.window?.convertPoint(toScreen: event.locationInWindow)
+            ?? event.cgEvent?.unflippedLocation ?? NSEvent.mouseLocation
+        return frame.contains(click)
+    }
+}
+
+@MainActor
 final class TokenFloatController {
     private let panel = TokenFloatPanel(
         contentRect: NSRect(origin: .zero, size: compactSizeWithCat),
@@ -14,6 +60,7 @@ final class TokenFloatController {
     private let showSettings: () -> Void
     private let showHistory: () -> Void
     private let showUpdate: () -> Void
+    private let outsideClicks = PanelOutsideClickMonitor()
     private var expanded = false
     private var started = false
     private var compactOriginBeforeExpansion: NSPoint?
@@ -79,12 +126,18 @@ final class TokenFloatController {
             panel.orderFrontRegardless()
         } else {
             panel.orderOut(nil)
+            if expanded { toggle() }
             panel.contentView = nil
         }
     }
 
     func update(_ meters: [ProviderMeter]) {
         meter.update(meters)
+    }
+
+    func setExpandedSources(_ sources: Set<MeterProvider>) {
+        guard meter.expandedSources != sources else { return }
+        meter.expandedSources = sources
     }
 
     func setDailyNumberStyle(_ style: DailyNumberStyle) {
@@ -129,6 +182,7 @@ final class TokenFloatController {
 
     private func toggle() {
         if expanded {
+            outsideClicks.stop()
             expanded = false
             if let compactOriginBeforeExpansion {
                 let frame = NSRect(origin: compactOriginBeforeExpansion, size: compactSize)
@@ -141,6 +195,10 @@ final class TokenFloatController {
             compactOriginBeforeExpansion = panel.frame.origin
             expanded = true
             resize(to: expandedSize)
+            outsideClicks.start(panel: panel) { [weak self] in
+                guard let self, self.expanded else { return }
+                self.toggle()
+            }
         }
         rebuildContent()
     }
@@ -407,6 +465,7 @@ private final class MeterDragHandle: NSView {
 @MainActor
 private final class MeterViewModel: ObservableObject {
     @Published private(set) var providers: [ProviderMeter] = []
+    @Published var expandedSources = Set(MeterProvider.allCases)
     @Published var dailyNumberStyle: DailyNumberStyle = .exact
     @Published var showsCat = true
 
@@ -427,6 +486,10 @@ private final class MeterViewModel: ObservableObject {
         if !unchanged { providers = next }
     }
 
+    var visibleProviders: [ProviderMeter] {
+        providers.filter { expandedSources.contains($0.provider) }
+    }
+
     var dailyUsage: DailyTokenSnapshot? {
         let counts = providers.compactMap(\.daily)
         guard !counts.isEmpty else { return nil }
@@ -439,22 +502,19 @@ private final class MeterViewModel: ObservableObject {
         )
     }
 
-    var activeCount: Int {
-        providers.reduce(0) { count, entry in
+    var visibleActiveCount: Int {
+        visibleProviders.reduce(0) { count, entry in
             count + entry.snapshot.rows.lazy.filter { $0.state != .finished }.count
         }
     }
 
-    var sourceAvailable: Bool {
-        providers.contains { $0.snapshot.sourceAvailable }
-    }
-
     var detailProviders: [ProviderMeter] {
-        guard let codex = providers.first(where: { $0.provider == .codex }),
-              let claude = providers.first(where: { $0.provider == .claude }),
-              claude.snapshot.sourceAvailable else { return providers }
-        let codexIsActive = codex.snapshot.sourceAvailable && codex.snapshot.rows.contains { $0.state != .finished }
-        return codexIsActive ? providers : [claude, codex]
+        func priority(_ entry: ProviderMeter) -> Int {
+            guard entry.snapshot.sourceAvailable else { return 3 }
+            if entry.snapshot.rows.contains(where: { $0.state != .finished }) { return 0 }
+            return entry.provider == .claude ? 1 : 2
+        }
+        return visibleProviders.sorted { priority($0) < priority($1) }
     }
 
     var totalRate: Double? {
@@ -556,7 +616,7 @@ private struct MeterFace: View {
         return VStack(alignment: .leading, spacing: 10) {
             header
             summary
-            dailyUsage
+            if !model.providers.isEmpty { dailyUsage }
             rows(width: width - 2 * padding)
             HStack {
                 if case .available = updates.state {
@@ -600,7 +660,8 @@ private struct MeterFace: View {
     }
 
     private var summary: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        let visible = model.visibleProviders
+        return VStack(alignment: .leading, spacing: 4) {
             Text("总速率")
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(secondary)
@@ -620,10 +681,10 @@ private struct MeterFace: View {
                     .lineLimit(1)
                     .frame(width: 84, alignment: .trailing)
             }
-            if !model.providers.isEmpty {
-                HStack(spacing: 8) {
-                    ForEach(model.providers) { entry in
-                        providerRate(entry)
+            if !visible.isEmpty {
+                HStack(spacing: visible.count > 2 ? 4 : 8) {
+                    ForEach(visible) { entry in
+                        providerRate(entry, dense: visible.count > 2)
                     }
                 }
                 .padding(.top, 5)
@@ -637,20 +698,25 @@ private struct MeterFace: View {
 
     private var activity: String {
         if model.providers.isEmpty { return "未启用来源" }
-        guard model.sourceAvailable else { return "会话不可读" }
-        let count = model.activeCount
+        let visible = model.visibleProviders
+        if visible.isEmpty { return "无显示来源" }
+        guard visible.contains(where: { $0.snapshot.sourceAvailable }) else { return "会话不可读" }
+        let count = model.visibleActiveCount
+        if visible.count < model.providers.count {
+            return count == 0 ? "所选来源空闲" : "显示 \(count) 个活跃对话"
+        }
         return count == 0 ? "当前空闲" : "\(count) 个活跃对话"
     }
 
     private var dailyUsage: some View {
         let usage = model.dailyUsage
-        let status = usage?.complete == false ? "部分来源仍在统计或无法读取" : ""
+        let status = usage?.complete == false ? "部分来源仍在统计或无法读取" : "包含所有已启用的数据来源"
         return HStack(spacing: 6) {
             Text("今日累计")
                 .font(.system(size: 11, weight: .semibold))
                 .fixedSize()
             Spacer(minLength: 4)
-            Text(usage.map { model.dailyNumberStyle.format($0.total) } ?? (model.providers.isEmpty ? "–" : "统计中…"))
+            Text(usage.map { model.dailyNumberStyle.format($0.total) } ?? "统计中…")
                 .font(.system(size: 14, weight: .semibold, design: .monospaced))
                 .lineLimit(1)
                 .minimumScaleFactor(0.65)
@@ -684,34 +750,37 @@ private struct MeterFace: View {
         .padding(.trailing, -7)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .overlay {
-            if model.providers.isEmpty {
-                Text("在设置中启用 Codex 或 Claude Code")
+            if providers.isEmpty {
+                Text(model.providers.isEmpty ? "在设置中启用数据来源" : "在常规设置中选择要展开显示的来源")
                     .font(.system(size: 11))
                     .foregroundStyle(secondary)
             }
         }
     }
 
-    private func providerRate(_ entry: ProviderMeter) -> some View {
+    private func providerRate(_ entry: ProviderMeter, dense: Bool) -> some View {
         VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 5) {
+            HStack(spacing: dense ? 3 : 5) {
                 providerDot(entry.provider)
                 Text(entry.provider.title)
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(secondary)
                     .lineLimit(1)
+                    .allowsTightening(true)
+                    .minimumScaleFactor(0.8)
             }
             HStack(alignment: .firstTextBaseline, spacing: 4) {
                 Text(rate(entry.rate))
                     .font(.system(size: 14, weight: .semibold, design: .monospaced))
                     .lineLimit(1)
-                    .frame(width: 44, alignment: .leading)
+                    .minimumScaleFactor(0.8)
                 Text("T/s")
                     .font(.system(size: 9, weight: .medium, design: .monospaced))
                     .foregroundStyle(secondary)
+                    .fixedSize()
             }
         }
-        .padding(.horizontal, 8)
+        .padding(.horizontal, dense ? 4 : 8)
         .padding(.vertical, 5)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 7))
@@ -739,6 +808,12 @@ private struct MeterFace: View {
             .padding(.horizontal, 3)
             .frame(height: 19)
             .accessibilityAddTraits(.isHeader)
+            if entry.provider == .antigravity {
+                Text("每段生成结束后显示该段的平均输出速率")
+                    .font(.system(size: 10))
+                    .foregroundStyle(secondary)
+                    .padding(.leading, 4)
+            }
             if entry.snapshot.rows.isEmpty {
                 Text(entry.snapshot.sourceAvailable ? "当前没有可显示的对话" : "暂时无法读取会话")
                     .font(.system(size: 10))
@@ -765,6 +840,7 @@ private struct MeterFace: View {
         switch provider {
         case .codex: Color(red: 85.0 / 255, green: 109.0 / 255, blue: 1)
         case .claude: Color(red: 237.0 / 255, green: 95.0 / 255, blue: 52.0 / 255)
+        case .antigravity: Color(red: 0.62, green: 0.49, blue: 0.95)
         }
     }
 

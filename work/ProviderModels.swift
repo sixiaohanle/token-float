@@ -19,6 +19,7 @@ struct HistoryLogRevision: Equatable {
 enum MeterProvider: String, CaseIterable, Identifiable {
     case codex
     case claude
+    case antigravity
 
     var id: String { rawValue }
 
@@ -26,18 +27,16 @@ enum MeterProvider: String, CaseIterable, Identifiable {
         switch self {
         case .codex: "Codex"
         case .claude: "Claude Code"
-        }
-    }
-
-    var historyFolder: String {
-        switch self {
-        case .codex: "sessions"
-        case .claude: "projects"
+        case .antigravity: "Antigravity"
         }
     }
 
     var historyFolders: [String] {
-        self == .codex ? [historyFolder, "archived_sessions"] : [historyFolder]
+        switch self {
+        case .codex: ["sessions", "archived_sessions"]
+        case .claude: ["projects"]
+        case .antigravity: ["antigravity", "antigravity-ide"]
+        }
     }
 }
 

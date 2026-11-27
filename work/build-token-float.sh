@@ -22,6 +22,7 @@ iconutil -c icns "$build_dir/TokenFloat.iconset" -o "$contents/Resources/TokenFl
 
 xcrun swiftc -O -target "$architecture-apple-macosx$minimum_version" \
     "$work_dir/main.swift" "$work_dir/TokenFloatUI.swift" "$work_dir/DetailSessionScroll.swift" \
+    "$work_dir/AntigravityMeter.swift" "$work_dir/AntigravitySampleReader.swift" \
     "$work_dir/RunningCat.swift" "$work_dir/CodexMeter.swift" \
     "$work_dir/DailyTokenUsage.swift" "$work_dir/ClaudeCodeMeter.swift" "$work_dir/ProviderModels.swift" \
     "$work_dir/MeterSettings.swift" "$work_dir/MeterApplication.swift" "$work_dir/UsageHistory.swift" \
@@ -50,9 +51,9 @@ cat > "$contents/Info.plist" <<PLIST
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.7.12</string>
+    <string>0.8.1</string>
     <key>CFBundleVersion</key>
-    <string>23</string>
+    <string>25</string>
     <key>LSMinimumSystemVersion</key>
     <string>$minimum_version</string>
     <key>LSUIElement</key>

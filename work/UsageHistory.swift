@@ -248,7 +248,7 @@ struct UsageHistoryView: View {
                 Text(item.title).tag(Optional(item))
             }
         }
-        .frame(width: 196)
+        .fixedSize()
         .pickerStyle(.segmented)
         .controlSize(.small)
         .labelsHidden()

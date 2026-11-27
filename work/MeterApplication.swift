@@ -18,7 +18,7 @@ private final class MeterSourceMonitor {
     let home: URL
     let identity = UUID()
     private let rateTimer: DispatchSourceTimer
-    private let dailyTimer: DispatchSourceTimer
+    private let usageTimer: DispatchSourceTimer
     private let importCancellation = HistoryImportCancellation()
 
     init(
@@ -29,10 +29,19 @@ private final class MeterSourceMonitor {
     ) {
         self.home = home
         let sampleRate: () -> MeterSnapshot
-        let sampleDaily: (Date) -> (events: [HistoryUsageEvent], complete: Bool)
-        let didPersistDaily: () -> Void
+        let sampleDaily: ((Date) -> (events: [HistoryUsageEvent], complete: Bool))?
+        let didPersistDaily: (() -> Void)?
         let scanHistory: HistoryScanner
         switch provider {
+        case .antigravity:
+            let rate = AntigravityMeter(home: home)
+            let usage = AntigravityUsage(home: home)
+            sampleRate = { rate.sample() }
+            sampleDaily = nil
+            didPersistDaily = nil
+            scanHistory = { _, shouldRead, shouldCancel, receive in
+                usage.scan(shouldRead: shouldRead, shouldCancel: shouldCancel, receive: receive)
+            }
         case .codex:
             let rate = CodexMeter(home: home)
             let daily = DailyTokenUsage(home: home)
@@ -51,42 +60,20 @@ private final class MeterSourceMonitor {
             scanHistory = history.scanHistory(through:shouldRead:shouldCancel:receive:)
         }
 
-        let rateQueue = DispatchQueue(label: "com.xiaohan.codex-token-float.rate.\(provider.rawValue)", qos: .utility)
-        let dailyQueue = DispatchQueue(label: "com.xiaohan.codex-token-float.daily.\(provider.rawValue)", qos: .utility)
-        rateTimer = DispatchSource.makeTimerSource(queue: rateQueue)
-        dailyTimer = DispatchSource.makeTimerSource(queue: dailyQueue)
+        rateTimer = Self.startRateTimer(
+            provider: provider, identity: identity, interval: .milliseconds(200),
+            sample: sampleRate, receive: receiveRate
+        )
+        let usageQueue = DispatchQueue(label: "com.xiaohan.codex-token-float.daily.\(provider.rawValue)", qos: .utility)
+        let usageTimer = DispatchSource.makeTimerSource(queue: usageQueue)
+        self.usageTimer = usageTimer
         let identity = identity
-        var lastRate: MeterSnapshot?
-        rateTimer.schedule(deadline: .now(), repeating: .milliseconds(250), leeway: .milliseconds(30))
-        rateTimer.setEventHandler {
-            let snapshot = autoreleasepool(invoking: sampleRate)
-            guard lastRate != snapshot else { return }
-            lastRate = snapshot
-            DispatchQueue.main.async { receiveRate(identity, snapshot) }
-        }
-        var lastDailyStatus: (day: String, complete: Bool)?
-        dailyTimer.schedule(deadline: .now(), repeating: .seconds(5), leeway: .milliseconds(300))
-        dailyTimer.setEventHandler {
-            let date = Date()
-            let (complete, changes, archive) = autoreleasepool { () -> (Bool, [String: LedgerDayTotal], ArchiveUsageTotals?) in
-                guard ledger.isAvailable else { return (false, [:], nil) }
-                let sampled = sampleDaily(date)
-                var archive: ArchiveUsageTotals?
-                let changes = sampled.events.isEmpty ? [:] : ledger.record(sampled.events, source: source) { archive = $0 }
-                if changes != nil { didPersistDaily() }
-                return (sampled.complete && changes != nil, changes ?? [:], archive)
-            }
-            let day = UsageDayKey.make(for: date)
-            guard !changes.isEmpty || archive != nil || lastDailyStatus?.day != day
-                    || lastDailyStatus?.complete != complete else { return }
-            lastDailyStatus = (day, complete)
-            DispatchQueue.main.async { receiveDaily(identity, date, complete, changes, archive) }
-        }
-        rateTimer.resume()
-        dailyTimer.resume()
-
         let cancellation = importCancellation
-        DispatchQueue.global(qos: .background).async {
+        let periodicHistory = provider == .antigravity
+        var lastDailyStatus: (day: String, complete: Bool)?
+        var lastHistoryStatus: HistoryImportStatus? = .importing
+
+        func importHistory(at date: Date) -> Bool {
             var pending: [String: LedgerDayTotal] = [:]
             var pendingArchive: ArchiveUsageTotals?
             var lastDelivery = Date()
@@ -100,7 +87,7 @@ private final class MeterSourceMonitor {
                 DispatchQueue.main.async { receiveHistory(identity, status, changes, archive) }
             }
             let complete = !failed && scanHistory(
-                Date(),
+                date,
                 { ledger.needsImport($0, source: source) },
                 { failed || cancellation.isCancelled },
                 { file, events in
@@ -112,7 +99,7 @@ private final class MeterSourceMonitor {
                     }
                     pending.merge(changes) { _, latest in latest }
                     if (!pending.isEmpty || pendingArchive != nil) && Date().timeIntervalSince(lastDelivery) >= 0.5 {
-                        deliver(.importing)
+                        deliver(lastHistoryStatus)
                     }
                 }
             )
@@ -134,14 +121,66 @@ private final class MeterSourceMonitor {
                     }
                 }
             }
-            if !cancellation.isCancelled { deliver(complete && !failed ? nil : .incomplete) }
+            let success = complete && !failed
+            guard !cancellation.isCancelled else { return false }
+            let status: HistoryImportStatus? = success ? nil : .incomplete
+            if status != lastHistoryStatus || !pending.isEmpty || pendingArchive != nil {
+                lastHistoryStatus = status
+                deliver(status)
+            }
+            return success
         }
+
+        usageTimer.schedule(deadline: .now(), repeating: .seconds(2), leeway: .milliseconds(150))
+        usageTimer.setEventHandler {
+            guard !cancellation.isCancelled else { return }
+            let date = Date()
+            let (complete, changes, archive) = autoreleasepool { () -> (Bool, [String: LedgerDayTotal], ArchiveUsageTotals?) in
+                if periodicHistory { return (importHistory(at: date), [:], nil) }
+                guard let sampleDaily, ledger.isAvailable else { return (false, [:], nil) }
+                let sampled = sampleDaily(date)
+                var archive: ArchiveUsageTotals?
+                let changes = sampled.events.isEmpty ? [:] : ledger.record(sampled.events, source: source) { archive = $0 }
+                if changes != nil { didPersistDaily?() }
+                return (sampled.complete && changes != nil, changes ?? [:], archive)
+            }
+            let day = UsageDayKey.make(for: date)
+            guard !changes.isEmpty || archive != nil || lastDailyStatus?.day != day
+                    || lastDailyStatus?.complete != complete else { return }
+            lastDailyStatus = (day, complete)
+            DispatchQueue.main.async { receiveDaily(identity, date, complete, changes, archive) }
+        }
+        usageTimer.resume()
+
+        if !periodicHistory {
+            DispatchQueue.global(qos: .background).async {
+                _ = importHistory(at: Date())
+            }
+        }
+    }
+
+    private static func startRateTimer(
+        provider: MeterProvider, identity: UUID, interval: DispatchTimeInterval,
+        sample: @escaping () -> MeterSnapshot, receive: @escaping (UUID, MeterSnapshot) -> Void
+    ) -> DispatchSourceTimer {
+        let queue = DispatchQueue(label: "com.xiaohan.codex-token-float.rate.\(provider.rawValue)", qos: .utility)
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        var lastRate: MeterSnapshot?
+        timer.schedule(deadline: .now(), repeating: interval, leeway: .milliseconds(30))
+        timer.setEventHandler {
+            let snapshot = autoreleasepool(invoking: sample)
+            guard lastRate != snapshot else { return }
+            lastRate = snapshot
+            DispatchQueue.main.async { receive(identity, snapshot) }
+        }
+        timer.resume()
+        return timer
     }
 
     deinit {
         importCancellation.cancel()
         rateTimer.cancel()
-        dailyTimer.cancel()
+        usageTimer.cancel()
     }
 }
 
@@ -161,6 +200,7 @@ final class MeterApplication: NSObject, NSApplicationDelegate {
     )
     private var statusItem: NSStatusItem?
     private var menuPanel: NSPanel?
+    private let menuOutsideClicks = PanelOutsideClickMonitor()
     private var settingsWindow: NSWindow?
     private var monitors: [MeterProvider: MeterSourceMonitor] = [:]
     private var rates: [MeterProvider: MeterSnapshot] = [:]
@@ -170,6 +210,10 @@ final class MeterApplication: NSObject, NSApplicationDelegate {
         floating.start()
         floating.setShowsCat(preferences.showsCat)
         floating.setDailyNumberStyle(preferences.dailyNumberStyle)
+        floating.setExpandedSources(preferences.expandedSources)
+        preferences.didChangeExpandedSources = { [weak self] sources in
+            self?.floating.setExpandedSources(sources)
+        }
         preferences.didChangeShowsCat = { [weak self] value in
             self?.floating.setShowsCat(value)
         }
@@ -242,9 +286,11 @@ final class MeterApplication: NSObject, NSApplicationDelegate {
     }
 
     private func showMenu() {
-        guard let button = statusItem?.button, let window = button.window,
-              let screen = window.screen ?? NSScreen.main else { return }
+        guard let button = statusItem?.button, let window = button.window else { return }
         let anchor = window.convertToScreen(button.convert(button.bounds, to: nil))
+        let center = NSPoint(x: anchor.midX, y: anchor.midY)
+        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(center) })
+                ?? window.screen ?? NSScreen.main else { return }
         let bounds = screen.visibleFrame.insetBy(dx: 5, dy: 5)
         let size = floating.menuContentSize(in: bounds)
         if menuPanel == nil {
@@ -265,11 +311,14 @@ final class MeterApplication: NSObject, NSApplicationDelegate {
         }
         let x = min(max(bounds.minX, anchor.midX - size.width / 2), max(bounds.minX, bounds.maxX - size.width))
         let y = max(bounds.minY, min(bounds.maxY, anchor.minY) - size.height)
-        menuPanel?.setFrame(NSRect(origin: NSPoint(x: x, y: y), size: size), display: true)
-        menuPanel?.orderFrontRegardless()
+        guard let panel = menuPanel else { return }
+        panel.setFrame(NSRect(origin: NSPoint(x: x, y: y), size: size), display: true)
+        panel.orderFrontRegardless()
+        menuOutsideClicks.start(panel: panel, toggleButton: button) { [weak self] in self?.closeMenu() }
     }
 
     private func closeMenu() {
+        menuOutsideClicks.stop()
         menuPanel?.orderOut(nil)
     }
 
@@ -306,7 +355,10 @@ final class MeterApplication: NSObject, NSApplicationDelegate {
         let folders = provider.historyFolders
         let folderLabel = folders.joined(separator: "」或「")
         picker.title = "选择\(provider.title)数据目录"
-        picker.message = "选择包含「\(folderLabel)」的本地数据目录。"
+        let instructions = provider == .antigravity
+            ? "选择 .gemini 目录以读取 App 和 IDE，或选择含有 conversations 的产品目录。"
+            : "选择包含「\(folderLabel)」的本地数据目录。"
+        picker.message = instructions
         picker.prompt = "使用目录"
         picker.canChooseDirectories = true
         picker.canChooseFiles = false
@@ -315,15 +367,24 @@ final class MeterApplication: NSObject, NSApplicationDelegate {
         picker.directoryURL = preferences.home(for: provider)
         picker.beginSheetModal(for: window) { [weak self, weak picker] result in
             guard let self, result == .OK, let url = picker?.url else { return }
-            let home = folders.contains(url.lastPathComponent) ? url.deletingLastPathComponent() : url
-            guard folders.contains(where: { folder in
-                var isDirectory: ObjCBool = false
-                let path = home.appendingPathComponent(folder, isDirectory: true).path
-                return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) && isDirectory.boolValue
-            }) else {
+            func isDirectory(_ url: URL) -> Bool {
+                (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+            }
+            let home: URL
+            let valid: Bool
+            if provider == .antigravity {
+                home = url.lastPathComponent == "conversations" ? url.deletingLastPathComponent() : url
+                valid = isDirectory(home.appendingPathComponent("conversations")) || folders.contains {
+                    isDirectory(home.appendingPathComponent($0).appendingPathComponent("conversations"))
+                }
+            } else {
+                home = folders.contains(url.lastPathComponent) ? url.deletingLastPathComponent() : url
+                valid = folders.contains { isDirectory(home.appendingPathComponent($0)) }
+            }
+            guard valid else {
                 let alert = NSAlert()
                 alert.messageText = "找不到\(provider.title)日志目录"
-                alert.informativeText = "请选择包含「\(folderLabel)」的目录。"
+                alert.informativeText = instructions
                 alert.beginSheetModal(for: window)
                 return
             }
@@ -361,24 +422,33 @@ final class MeterApplication: NSObject, NSApplicationDelegate {
                 receiveRate: { [weak self] identity, snapshot in
                     guard let self, monitors[provider]?.identity == identity else { return }
                     rates[provider] = snapshot
-                    let workspaces = Set(snapshot.rows.filter { $0.state != .finished }.map(\.project))
-                    let status = snapshot.sourceAvailable
-                        ? (workspaces.isEmpty ? "已识别 · 当前空闲" : "\(workspaces.count) 个活跃工作区")
-                        : "未找到会话日志"
+                    let active = snapshot.rows.filter { $0.state != .finished }
+                    let status: String
+                    if !snapshot.sourceAvailable {
+                        status = "未找到会话日志"
+                    } else if active.isEmpty {
+                        status = "已识别 · 当前空闲"
+                    } else if provider == .antigravity {
+                        status = "\(active.count) 个对话最近有输出"
+                    } else {
+                        status = "\(Set(active.map(\.project)).count) 个活跃工作区"
+                    }
                     preferences.setStatus(status, for: provider)
                     publish()
                 },
                 receiveDaily: { [weak self] identity, date, complete, changes, archive in
-                    guard let self, monitors[provider]?.identity == identity else { return }
+                    guard let self else { return }
                     history.receive(changes, recovered: archive, source: source)
+                    guard monitors[provider]?.identity == identity else { return }
                     guard UsageHistory.dayKey(for: date) == UsageHistory.dayKey(for: Date()) else { return }
                     let cached = history.snapshot(for: provider, home: home, at: date)?.total ?? 0
                     daily[provider] = DailyTokenSnapshot(total: cached, complete: complete)
                     publish()
                 },
                 receiveHistory: { [weak self] identity, status, changes, archive in
-                    guard let self, monitors[provider]?.identity == identity else { return }
+                    guard let self else { return }
                     history.receive(changes, recovered: archive, source: source)
+                    guard monitors[provider]?.identity == identity else { return }
                     history.setImportStatus(status, for: provider)
                     if let cached = history.snapshot(for: provider, home: home) {
                         daily[provider] = DailyTokenSnapshot(
